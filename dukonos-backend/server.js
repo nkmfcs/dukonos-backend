@@ -57,6 +57,35 @@ app.post('/api/products', async (req, res) => {
   }
 });
 
+// 4. Продажа товара (Списание со склада)
+app.post('/api/sell', async (req, res) => {
+  const { store_id, product_id, quantity } = req.body;
+  
+  try {
+    // Безопасное списание: проверяем, что товара хватает, и отнимаем количество
+    const result = await pool.query(`
+      UPDATE inventory 
+      SET stock = stock - $1 
+      WHERE store_id = $2 AND product_id = $3 AND stock >= $1
+      RETURNING stock;
+    `, [quantity, store_id, product_id]);
+
+    // Если товар не найден или его меньше, чем хотят купить
+    if (result.rows.length === 0) {
+      return res.status(400).json({ error: 'Недостаточно товара на складе!' });
+    }
+
+    res.json({ 
+      message: 'Товар успешно продан!', 
+      leftInStock: result.rows[0].stock 
+    });
+    
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Ошибка сервера при продаже' });
+  }
+});
+
 // Запускаем сервер
 app.listen(port, () => {
   console.log(`Сервер DukonOS запущен на порту ${port}`);
