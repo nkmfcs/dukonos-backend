@@ -126,6 +126,24 @@ app.get('/api/me', authenticateToken, async (req, res) => {
   }
 });
 
+// ОБНОВЛЕНИЕ ПРОФИЛЯ (Смена ФИО и названия магазина)
+app.put('/api/me', authenticateToken, async (req, res) => {
+  const { name, phone, store_name } = req.body;
+  try {
+    if (req.user.role === 'owner') {
+      // Обновляем данные владельца
+      await pool.query('UPDATE owners SET name = $1, phone = $2 WHERE id = $3', [name, phone, req.user.owner_id]);
+      // Обновляем название магазина
+      if (store_name) {
+        await pool.query('UPDATE stores SET name = $1 WHERE owner_id = $2', [store_name, req.user.owner_id]);
+      }
+      res.json({ message: 'Профиль успешно обновлен!' });
+    } else {
+      res.status(403).json({ error: 'Кассир не может менять настройки магазина' });
+    }
+  } catch (err) { res.status(500).json({ error: 'Ошибка обновления' }); }
+});
+
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
   try {
     const owner_id = req.user.owner_id;
