@@ -200,4 +200,21 @@ app.post('/api/sell', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка сервера' }); }
 });
 
+// УДАЛЕНИЕ ТОВАРА (Только для владельца)
+app.delete('/api/products/:id', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только владелец может удалять товары' });
+  const productId = req.params.id;
+  
+  try {
+    // Сначала удаляем со склада (inventory), затем саму карточку товара (products)
+    await pool.query('DELETE FROM inventory WHERE product_id = $1', [productId]);
+    await pool.query('DELETE FROM products WHERE id = $1 AND owner_id = $2', [productId, req.user.owner_id]);
+    
+    res.json({ message: 'Товар успешно удален!' });
+  } catch (err) { 
+    console.error(err); 
+    res.status(500).json({ error: 'Ошибка при удалении товара' }); 
+  }
+});
+
 app.listen(port, () => { console.log(`Сервер запущен на ${port}`); });
