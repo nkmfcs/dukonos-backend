@@ -48,6 +48,7 @@ app.post('/api/login', async (req, res) => {
     let empRes = await pool.query('SELECT e.*, s.owner_id FROM employees e JOIN stores s ON e.store_id = s.id WHERE e.username = $1', [email]);
     if (empRes.rows.length > 0) {
       if (!await bcrypt.compare(password, empRes.rows[0].password_hash)) return res.status(401).json({ error: 'Неверный пароль' });
+      // ВАЖНО: Мы сохраняем store_id кассира в токен
       return res.json({ token: jwt.sign({ owner_id: empRes.rows[0].owner_id, store_id: empRes.rows[0].store_id, role: 'employee' }, process.env.JWT_SECRET, { expiresIn: '7d' }), role: 'employee' });
     }
     res.status(401).json({ error: 'Не найден' });
@@ -77,7 +78,7 @@ app.put('/api/me', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
 });
 
-// === ДАШБОРД (ИДЕАЛЬНАЯ ЛОГИКА ДАТ) ===
+// === ДАШБОРД ===
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
   try {
     const period = req.query.period || 'today';
@@ -87,16 +88,11 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
 
     const result = await pool.query(`
       SELECT COALESCE(SUM(s.total_price), 0) as total_revenue, COUNT(s.id) as total_checks 
-      FROM sales s 
-      JOIN stores st ON s.store_id = st.id 
+      FROM sales s JOIN stores st ON s.store_id = st.id 
       WHERE st.owner_id = $1 AND ${dateFilter};
     `, [req.user.owner_id]);
-    
     res.json({ revenue: Number(result.rows[0].total_revenue), checks: Number(result.rows[0].total_checks) });
-  } catch (err) { 
-    console.error("DASHBOARD ERROR:", err);
-    res.status(500).json({ error: 'Ошибка дашборда' }); 
-  }
+  } catch (err) { res.status(500).json({ error: 'Ошибка дашборда' }); }
 });
 
 // === СЕТЬ И СОТРУДНИКИ ===
@@ -111,7 +107,7 @@ app.get('/api/stores', authenticateToken, async (req, res) => {
       FROM stores s WHERE s.owner_id = $1 ORDER BY s.id ASC;
     `, [req.user.owner_id]);
     res.json(result.rows);
-  } catch (err) { console.error("STORES ERR:", err); res.status(500).json({ error: 'Ошибка сети' }); }
+  } catch (err) { res.status(500).json({ error: 'Ошибка сети' }); }
 });
 
 app.post('/api/stores', authenticateToken, async (req, res) => {
@@ -125,7 +121,8 @@ app.post('/api/stores', authenticateToken, async (req, res) => {
 app.get('/api/employees', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
   try {
-    const result = await pool.query(`SELECT e.id, e.name, e.username, s.name as store_name FROM employees e JOIN stores s ON e.store_id = s.id WHERE s.owner_id = $1 ORDER BY e.id DESC;`, [req.user.owner_id]);
+    // ВАЖНО: Добавили s.id as store_id, чтобы фронтенд знал, откуда брать логи
+    const result = await pool.query(`SELECT e.id, e.name, e.username, s.name as store_name, s.id as store_id FROM employees e JOIN stores s ON e.store_id = s.id WHERE s.owner_id = $1 ORDER BY e.id DESC;`, [req.user.owner_id]);
     res.json(result.rows);
   } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
 });
@@ -138,6 +135,19 @@ app.post('/api/employees', authenticateToken, async (req, res) => {
     await pool.query('INSERT INTO employees (store_id, username, password_hash, name) VALUES ($1, $2, $3, $4)', [req.body.store_id, req.body.username, hash, req.body.name]);
     res.json({ message: 'Создано' });
   } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
+});
+
+// === НОВЫЙ МАРШРУТ: ИСТОРИЯ АКТИВНОСТИ ===
+app.get('/api/logs/:store_id', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
+  try {
+    const logs = await pool.query(`
+      SELECT s.total_price, s.created_at, p.name as product_name, s.quantity
+      FROM sales s JOIN products p ON s.product_id = p.id
+      WHERE s.store_id = $1 ORDER BY s.created_at DESC LIMIT 15;
+    `, [req.params.store_id]);
+    res.json(logs.rows);
+  } catch (err) { res.status(500).json({ error: 'Ошибка логов' }); }
 });
 
 // === ТОВАРЫ И ПРОДАЖИ ===
@@ -161,8 +171,15 @@ app.post('/api/products', authenticateToken, async (req, res) => {
 app.post('/api/sell', authenticateToken, async (req, res) => {
   const { product_id, quantity, payment_method } = req.body;
   try {
-    const storeRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id]);
-    const store_id = storeRes.rows[0].id;
+    // === ГЛАВНОЕ ИСПРАВЛЕНИЕ БАГА С КАССИРОМ ===
+    let store_id;
+    if (req.user.role === 'employee') {
+        store_id = req.user.store_id; // Кассир ВСЕГДА продает в свой магазин
+    } else {
+        const storeRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id]);
+        store_id = storeRes.rows[0].id; // Владелец в главный
+    }
+
     const prodRes = await pool.query('SELECT price FROM products WHERE id = $1 AND owner_id = $2', [product_id, req.user.owner_id]);
     const total_price = prodRes.rows[0].price * quantity;
     const updateRes = await pool.query('UPDATE inventory SET stock = stock - $1 WHERE store_id = $2 AND product_id = $3 AND stock >= $1 RETURNING stock;', [quantity, store_id, product_id]);
@@ -192,7 +209,7 @@ app.get('/api/finance', authenticateToken, async (req, res) => {
     const actualCash = cash - (Number(expRes.rows[0].total) || 0);
     const supRes = await pool.query(`SELECT id, name, debt FROM suppliers WHERE owner_id = $1 ORDER BY id ASC`, [req.user.owner_id]);
     res.json({ total_balance: actualCash + card, cash: actualCash, card: card, suppliers: supRes.rows });
-  } catch (err) { console.error("FINANCE ERR:", err); res.status(500).json({ error: 'Ошибка финансов' }); }
+  } catch (err) { res.status(500).json({ error: 'Ошибка финансов' }); }
 });
 
 app.post('/api/finance/expense', authenticateToken, async (req, res) => {
