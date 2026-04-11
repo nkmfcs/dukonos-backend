@@ -106,26 +106,45 @@ app.put('/api/me', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка обновления' }); }
 });
 
+// ПОЛУЧИТЬ СПИСОК СОТРУДНИКОВ
+app.get('/api/employees', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
+  try {
+    const result = await pool.query(`
+      SELECT e.id, e.name, e.username, s.name as store_name
+      FROM employees e
+      JOIN stores s ON e.store_id = s.id
+      WHERE s.owner_id = $1
+      ORDER BY e.id DESC;
+    `, [req.user.owner_id]);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: 'Ошибка загрузки сотрудников' }); }
+});
+
+// СОЗДАТЬ СОТРУДНИКА (С привязкой к конкретному магазину)
 app.post('/api/employees', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только владелец может добавлять сотрудников' });
-  const { name, username, password } = req.body;
+  const { name, username, password, store_id } = req.body;
   const owner_id = req.user.owner_id;
   try {
-    const storeRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [owner_id]);
-    if (storeRes.rows.length === 0) return res.status(400).json({ error: 'У вас нет привязанного магазина! Создайте новый аккаунт.' });
-    const store_id = storeRes.rows[0].id;
+    let final_store_id = store_id;
+    // Если магазин не выбран, берем первый попавшийся магазин владельца
+    if (!final_store_id) {
+      const storeRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [owner_id]);
+      if (storeRes.rows.length === 0) return res.status(400).json({ error: 'У вас нет привязанного магазина!' });
+      final_store_id = storeRes.rows[0].id;
+    }
 
     const salt = await bcrypt.genSalt(10);
     const password_hash = await bcrypt.hash(password, salt);
 
     await pool.query(
       'INSERT INTO employees (store_id, username, password_hash, name) VALUES ($1, $2, $3, $4)', 
-      [store_id, username, password_hash, name]
+      [final_store_id, username, password_hash, name]
     );
     res.json({ message: 'Кассир успешно создан!' });
   } catch (err) { 
-    console.error("ОШИБКА СОЗДАНИЯ КАССИРА:", err);
-    res.status(500).json({ error: 'Техническая ошибка: ' + err.message }); 
+    res.status(500).json({ error: 'Техническая ошибка (возможно, логин занят)' }); 
   }
 });
 
