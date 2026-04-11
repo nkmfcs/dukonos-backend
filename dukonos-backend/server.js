@@ -19,11 +19,11 @@ const pool = new Pool({
   port: 5432,
 });
 
-// === ФЕЙСКОНТРОЛЬ (ОХРАННИК) ===
+// === ФЕЙСКОНТРОЛЬ ===
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'Доступ запрещен. Нет пропуска.' });
+  if (!token) return res.status(401).json({ error: 'Доступ запрещен.' });
 
   jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
     if (err) return res.status(403).json({ error: 'Токен истек или подделан.' });
@@ -32,7 +32,7 @@ function authenticateToken(req, res, next) {
   });
 }
 
-// === ОТКРЫТЫЕ МАРШРУТЫ ===
+// === АВТОРИЗАЦИЯ И ПРОФИЛЬ ===
 app.get('/api/ping', (req, res) => res.json({ message: 'Бэкенд работает!' }));
 
 app.post('/api/register', async (req, res) => {
@@ -40,12 +40,9 @@ app.post('/api/register', async (req, res) => {
   try {
     const salt = await bcrypt.genSalt(10);
     const password_hash = await bcrypt.hash(password, salt);
-
     const newOwner = await pool.query('INSERT INTO owners (email, password_hash) VALUES ($1, $2) RETURNING id, email', [email, password_hash]);
     const ownerId = newOwner.rows[0].id;
-
     await pool.query('INSERT INTO stores (name, location, owner_id) VALUES ($1, $2, $3)', ['Мой первый магазин', 'Главная точка', ownerId]);
-
     res.json({ message: 'Регистрация успешна!', owner: newOwner.rows[0] });
   } catch (err) { res.status(500).json({ error: 'Ошибка регистрации' }); }
 });
@@ -70,12 +67,9 @@ app.post('/api/login', async (req, res) => {
       const token = jwt.sign({ owner_id: emp.owner_id, store_id: emp.store_id, role: 'employee', username: emp.username }, process.env.JWT_SECRET, { expiresIn: '7d' });
       return res.json({ token: token, role: 'employee', message: 'Вход Кассира!' });
     }
-
     return res.status(401).json({ error: 'Пользователь не найден' });
   } catch (err) { res.status(500).json({ error: 'Ошибка при входе' }); }
 });
-
-// === ЗАКРЫТЫЕ МАРШРУТЫ ===
 
 app.get('/api/me', authenticateToken, async (req, res) => {
   try {
@@ -106,7 +100,7 @@ app.put('/api/me', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка обновления' }); }
 });
 
-// ПОЛУЧИТЬ СПИСОК СОТРУДНИКОВ
+// === СОТРУДНИКИ ===
 app.get('/api/employees', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
   try {
@@ -121,45 +115,37 @@ app.get('/api/employees', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка загрузки сотрудников' }); }
 });
 
-// СОЗДАТЬ СОТРУДНИКА (С привязкой к конкретному магазину)
 app.post('/api/employees', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только владелец может добавлять сотрудников' });
   const { name, username, password, store_id } = req.body;
-  const owner_id = req.user.owner_id;
   try {
     let final_store_id = store_id;
-    // Если магазин не выбран, берем первый попавшийся магазин владельца
     if (!final_store_id) {
-      const storeRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [owner_id]);
+      const storeRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id]);
       if (storeRes.rows.length === 0) return res.status(400).json({ error: 'У вас нет привязанного магазина!' });
       final_store_id = storeRes.rows[0].id;
     }
-
     const salt = await bcrypt.genSalt(10);
     const password_hash = await bcrypt.hash(password, salt);
-
     await pool.query(
       'INSERT INTO employees (store_id, username, password_hash, name) VALUES ($1, $2, $3, $4)', 
       [final_store_id, username, password_hash, name]
     );
     res.json({ message: 'Кассир успешно создан!' });
-  } catch (err) { 
-    res.status(500).json({ error: 'Техническая ошибка (возможно, логин занят)' }); 
-  }
+  } catch (err) { res.status(500).json({ error: 'Техническая ошибка (возможно, логин занят)' }); }
 });
 
+// === ДАШБОРД И ТОВАРЫ ===
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
   try {
-    const owner_id = req.user.owner_id;
-    const result = await pool.query(`SELECT COALESCE(SUM(s.total_price), 0) as total_revenue, COUNT(s.id) as total_checks FROM sales s JOIN stores st ON s.store_id = st.id WHERE st.owner_id = $1;`, [owner_id]);
+    const result = await pool.query(`SELECT COALESCE(SUM(s.total_price), 0) as total_revenue, COUNT(s.id) as total_checks FROM sales s JOIN stores st ON s.store_id = st.id WHERE st.owner_id = $1;`, [req.user.owner_id]);
     res.json({ revenue: Number(result.rows[0].total_revenue), checks: Number(result.rows[0].total_checks) });
   } catch (err) { res.status(500).json({ error: 'Ошибка дашборда' }); }
 });
 
 app.get('/api/products', authenticateToken, async (req, res) => {
   try {
-    const owner_id = req.user.owner_id;
-    const result = await pool.query(`SELECT p.id, p.icon, p.name, p.category, p.barcode, p.price, i.stock FROM products p JOIN inventory i ON p.id = i.product_id JOIN stores st ON i.store_id = st.id WHERE st.owner_id = $1;`, [owner_id]);
+    const result = await pool.query(`SELECT p.id, p.icon, p.name, p.category, p.barcode, p.price, i.stock FROM products p JOIN inventory i ON p.id = i.product_id JOIN stores st ON i.store_id = st.id WHERE st.owner_id = $1;`, [req.user.owner_id]);
     res.json(result.rows);
   } catch (err) { res.status(500).json({ error: 'Ошибка БД' }); }
 });
@@ -171,20 +157,17 @@ app.post('/api/products', authenticateToken, async (req, res) => {
     const newP = await pool.query('INSERT INTO products (barcode, name, category, price, icon, owner_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *', [barcode, name, category, price, icon, owner_id]);
     const productId = newP.rows[0].id;
     const storeRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [owner_id]);
-    const store_id = storeRes.rows[0].id;
-    const initialStock = stock ? Number(stock) : 0;
-    await pool.query('INSERT INTO inventory (store_id, product_id, stock) VALUES ($1, $2, $3)', [store_id, productId, initialStock]);
+    await pool.query('INSERT INTO inventory (store_id, product_id, stock) VALUES ($1, $2, $3)', [storeRes.rows[0].id, productId, stock ? Number(stock) : 0]);
     res.json(newP.rows[0]);
   } catch (err) { res.status(500).json({ error: 'Ошибка создания' }); }
 });
 
 app.post('/api/sell', authenticateToken, async (req, res) => {
   const { product_id, quantity } = req.body;
-  const owner_id = req.user.owner_id;
   try {
-    const storeRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [owner_id]);
+    const storeRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id]);
     const store_id = storeRes.rows[0].id;
-    const prodRes = await pool.query('SELECT price FROM products WHERE id = $1 AND owner_id = $2', [product_id, owner_id]);
+    const prodRes = await pool.query('SELECT price FROM products WHERE id = $1 AND owner_id = $2', [product_id, req.user.owner_id]);
     if (prodRes.rows.length === 0) return res.status(404).json({ error: 'Товар не найден' });
     const total_price = prodRes.rows[0].price * quantity;
     const updateRes = await pool.query('UPDATE inventory SET stock = stock - $1 WHERE store_id = $2 AND product_id = $3 AND stock >= $1 RETURNING stock;', [quantity, store_id, product_id]);
@@ -195,13 +178,12 @@ app.post('/api/sell', authenticateToken, async (req, res) => {
 });
 
 app.delete('/api/products/:id', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только владелец может удалять товары' });
-  const productId = req.params.id;
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только владелец' });
   try {
-    await pool.query('DELETE FROM inventory WHERE product_id = $1', [productId]);
-    await pool.query('DELETE FROM products WHERE id = $1 AND owner_id = $2', [productId, req.user.owner_id]);
-    res.json({ message: 'Товар успешно удален!' });
-  } catch (err) { res.status(500).json({ error: 'Ошибка при удалении товара' }); }
+    await pool.query('DELETE FROM inventory WHERE product_id = $1', [req.params.id]);
+    await pool.query('DELETE FROM products WHERE id = $1 AND owner_id = $2', [req.params.id, req.user.owner_id]);
+    res.json({ message: 'Удалено!' });
+  } catch (err) { res.status(500).json({ error: 'Ошибка при удалении' }); }
 });
 
 // === УПРАВЛЕНИЕ СЕТЬЮ (МАГАЗИНЫ) ===
@@ -209,13 +191,10 @@ app.get('/api/stores', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
   try {
     const result = await pool.query(`
-      SELECT 
-        s.id, s.name, s.location,
+      SELECT s.id, s.name, s.location,
         (SELECT COUNT(*) FROM employees WHERE store_id = s.id) as emp_count,
         COALESCE((SELECT SUM(total_price) FROM sales WHERE store_id = s.id), 0) as total_revenue
-      FROM stores s
-      WHERE s.owner_id = $1
-      ORDER BY s.id ASC;
+      FROM stores s WHERE s.owner_id = $1 ORDER BY s.id ASC;
     `, [req.user.owner_id]);
     res.json(result.rows);
   } catch (err) { res.status(500).json({ error: 'Ошибка загрузки магазинов' }); }
@@ -223,13 +202,9 @@ app.get('/api/stores', authenticateToken, async (req, res) => {
 
 app.post('/api/stores', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
-  const { name, location } = req.body;
   try {
-    await pool.query(
-      'INSERT INTO stores (name, location, owner_id) VALUES ($1, $2, $3)', 
-      [name, location || 'Без адреса', req.user.owner_id]
-    );
-    res.json({ message: 'Новая точка успешно добавлена!' });
+    await pool.query('INSERT INTO stores (name, location, owner_id) VALUES ($1, $2, $3)', [req.body.name, req.body.location || 'Без адреса', req.user.owner_id]);
+    res.json({ message: 'Новая точка добавлена!' });
   } catch (err) { res.status(500).json({ error: 'Ошибка создания магазина' }); }
 });
 
