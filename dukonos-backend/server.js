@@ -112,22 +112,23 @@ app.get('/api/products', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/products', authenticateToken, async (req, res) => {
-  const { barcode, name, category, price, icon } = req.body;
+  // ДОБАВИЛИ stock В СПИСОК ПРИНИМАЕМЫХ ДАННЫХ
+  const { barcode, name, category, price, icon, stock } = req.body;
   const owner_id = req.user.owner_id;
   try {
-    // Сохраняем товар с привязкой к владельцу
     const newP = await pool.query(
       'INSERT INTO products (barcode, name, category, price, icon, owner_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
       [barcode, name, category, price, icon, owner_id]
     );
     const productId = newP.rows[0].id;
     
-    // Узнаем ID магазина этого владельца
     const storeRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [owner_id]);
     const store_id = storeRes.rows[0].id;
 
-    // Кладем на склад
-    await pool.query('INSERT INTO inventory (store_id, product_id, stock) VALUES ($1, $2, 0)', [store_id, productId]);
+    // ТЕПЕРЬ КЛАДЕМ НА СКЛАД НЕ 0, А ТО КОЛИЧЕСТВО, ЧТО ВВЕЛ ВЛАДЕЛЕЦ
+    const initialStock = stock ? Number(stock) : 0;
+    await pool.query('INSERT INTO inventory (store_id, product_id, stock) VALUES ($1, $2, $3)', [store_id, productId, initialStock]);
+    
     res.json(newP.rows[0]);
   } catch (err) { console.error(err); res.status(500).json({ error: 'Ошибка создания' }); }
 });
