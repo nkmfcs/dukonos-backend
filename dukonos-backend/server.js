@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
@@ -12,7 +13,7 @@ const pool = new Pool({
   user: 'postgres',
   host: 'localhost',
   database: 'dukonos_db',
-  password: 'ТВОЙ_ПАРОЛЬ_ОТ_БД', 
+  password: process.env.DB_PASSWORD, 
   port: 5432,
 });
 
