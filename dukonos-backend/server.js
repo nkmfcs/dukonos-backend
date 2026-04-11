@@ -89,12 +89,18 @@ app.post('/api/login', async (req, res) => {
 // === ЗАКРЫТЫЕ МАРШРУТЫ ===
 
 // НОВЫЙ МАРШРУТ: Создание кассира (Только для CEO)
+// НОВЫЙ МАРШРУТ: Создание кассира (Только для CEO)
 app.post('/api/employees', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только владелец может добавлять сотрудников' });
   const { name, username, password } = req.body;
   const owner_id = req.user.owner_id;
   try {
     const storeRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [owner_id]);
+    
+    // ПРОВЕРКА: А есть ли вообще магазин у этого владельца?
+    if (storeRes.rows.length === 0) {
+        return res.status(400).json({ error: 'У вас нет привязанного магазина! Создайте новый аккаунт.' });
+    }
     const store_id = storeRes.rows[0].id;
 
     const salt = await bcrypt.genSalt(10);
@@ -105,7 +111,11 @@ app.post('/api/employees', authenticateToken, async (req, res) => {
       [store_id, username, password_hash, name]
     );
     res.json({ message: 'Кассир успешно создан!' });
-  } catch (err) { res.status(500).json({ error: 'Ошибка создания кассира (Возможно логин занят)' }); }
+  } catch (err) { 
+    console.error("ОШИБКА СОЗДАНИЯ КАССИРА:", err);
+    // ТЕПЕРЬ СЕРВЕР ОТПРАВИТ НАМ РЕАЛЬНЫЙ ТЕКСТ ОШИБКИ ИЗ БАЗЫ ДАННЫХ
+    res.status(500).json({ error: 'Техническая ошибка: ' + err.message }); 
+  }
 });
 
 // ПОЛУЧИТЬ ДАННЫЕ ТЕКУЩЕГО ПРОФИЛЯ
