@@ -26,7 +26,6 @@ function authenticateToken(req, res, next) {
   });
 }
 
-// === АВТОРИЗАЦИЯ И ПРОФИЛЬ ===
 app.post('/api/register', async (req, res) => {
   const { email, password } = req.body;
   try {
@@ -45,7 +44,6 @@ app.post('/api/login', async (req, res) => {
       if (!await bcrypt.compare(password, userRes.rows[0].password_hash)) return res.status(401).json({ error: 'Неверный пароль' });
       return res.json({ token: jwt.sign({ owner_id: userRes.rows[0].id, role: 'owner' }, process.env.JWT_SECRET, { expiresIn: '7d' }), role: 'owner' });
     }
-    
     let empRes = await pool.query('SELECT e.*, s.owner_id FROM employees e JOIN stores s ON e.store_id = s.id WHERE e.username = $1', [email]);
     if (empRes.rows.length > 0) {
       if (!await bcrypt.compare(password, empRes.rows[0].password_hash)) return res.status(401).json({ error: 'Неверный пароль' });
@@ -67,7 +65,6 @@ app.get('/api/me', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка профиля' }); }
 });
 
-// === ДАШБОРД И СЕТЬ ===
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
   try {
     const period = req.query.period || 'today';
@@ -84,16 +81,26 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка дашборда' }); }
 });
 
+// === ИСПРАВЛЕННЫЙ МАРШРУТ: ТЕПЕРЬ ПОДДЕРЖИВАЕТ ФИЛЬТР ПО ДАТАМ ===
 app.get('/api/stores', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
   try {
+    const dateParam = req.query.date;
+    let dateCondition = "created_at >= CURRENT_DATE";
+    let queryParams = [req.user.owner_id];
+
+    if (dateParam) {
+        dateCondition = "DATE(created_at) = $2";
+        queryParams.push(dateParam);
+    }
+
     const result = await pool.query(`
       SELECT s.id, s.name, s.location,
         (SELECT COUNT(*) FROM employees WHERE store_id = s.id) as emp_count,
-        COALESCE((SELECT SUM(total_price) FROM sales WHERE store_id = s.id AND created_at >= CURRENT_DATE), 0) as total_revenue,
-        (SELECT COUNT(id) FROM sales WHERE store_id = s.id AND created_at >= CURRENT_DATE) as total_checks
+        COALESCE((SELECT SUM(total_price) FROM sales WHERE store_id = s.id AND ${dateCondition}), 0) as total_revenue,
+        (SELECT COUNT(id) FROM sales WHERE store_id = s.id AND ${dateCondition}) as total_checks
       FROM stores s WHERE s.owner_id = $1 ORDER BY s.id ASC;
-    `, [req.user.owner_id]);
+    `, queryParams);
     res.json(result.rows);
   } catch (err) { res.status(500).json({ error: 'Ошибка сети' }); }
 });
@@ -124,21 +131,29 @@ app.post('/api/employees', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
 });
 
-// ИСТОРИЯ КОНКРЕТНОГО МАГАЗИНА (За сегодня)
+// === ИСПРАВЛЕННЫЙ МАРШРУТ ЛОГОВ: ФИЛЬТР ПО ДАТАМ ===
 app.get('/api/logs/:store_id', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
   try {
+    const dateParam = req.query.date;
+    let dateCondition = "s.created_at >= CURRENT_DATE";
+    let queryParams = [req.params.store_id];
+
+    if (dateParam) {
+        dateCondition = "DATE(s.created_at) = $2";
+        queryParams.push(dateParam);
+    }
+
     const logs = await pool.query(`
       SELECT s.total_price, s.created_at, p.name as product_name, s.quantity
       FROM sales s JOIN products p ON s.product_id = p.id
-      WHERE s.store_id = $1 AND s.created_at >= CURRENT_DATE
-      ORDER BY s.created_at DESC LIMIT 20;
-    `, [req.params.store_id]);
+      WHERE s.store_id = $1 AND ${dateCondition}
+      ORDER BY s.created_at DESC LIMIT 50;
+    `, queryParams);
     res.json(logs.rows);
   } catch (err) { res.status(500).json({ error: 'Ошибка логов' }); }
 });
 
-// ГЛОБАЛЬНАЯ ИСТОРИЯ СЕТИ (С самого начала создания)
 app.get('/api/logs_all', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
   try {
@@ -154,7 +169,6 @@ app.get('/api/logs_all', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка логов' }); }
 });
 
-// === ТОВАРЫ И ПРОДАЖИ ===
 app.get('/api/products', authenticateToken, async (req, res) => {
   try {
     if (req.user.role === 'employee') {
@@ -210,7 +224,6 @@ app.delete('/api/products/:id', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
 });
 
-// === ФИНАНСЫ ===
 app.get('/api/finance', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
   try {
