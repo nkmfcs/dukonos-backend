@@ -19,18 +19,19 @@ const pool = new Pool({
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'Доступ запрещен.' });
+  if (!token) return res.status(401).json({ error: 'Нет доступа' });
   jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-    if (err) return res.status(403).json({ error: 'Токен истек.' });
+    if (err) return res.status(403).json({ error: 'Токен истек' });
     req.user = user; next();
   });
 }
 
+// === АВТОРИЗАЦИЯ ===
 app.post('/api/register', async (req, res) => {
   const { email, password } = req.body;
   try {
     const hash = await bcrypt.hash(password, await bcrypt.genSalt(10));
-    const newOwner = await pool.query('INSERT INTO owners (email, password_hash) VALUES ($1, $2) RETURNING id, email', [email, hash]);
+    const newOwner = await pool.query('INSERT INTO owners (email, password_hash) VALUES ($1, $2) RETURNING id', [email, hash]);
     await pool.query('INSERT INTO stores (name, location, owner_id) VALUES ($1, $2, $3)', ['Мой первый магазин', 'Главная точка', newOwner.rows[0].id]);
     res.json({ message: 'Регистрация успешна!' });
   } catch (err) { res.status(500).json({ error: 'Ошибка регистрации' }); }
@@ -50,7 +51,7 @@ app.post('/api/login', async (req, res) => {
       return res.json({ token: jwt.sign({ owner_id: empRes.rows[0].owner_id, store_id: empRes.rows[0].store_id, role: 'employee' }, process.env.JWT_SECRET, { expiresIn: '7d' }), role: 'employee' });
     }
     res.status(401).json({ error: 'Не найден' });
-  } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
+  } catch (err) { res.status(500).json({ error: 'Ошибка входа' }); }
 });
 
 app.get('/api/me', authenticateToken, async (req, res) => {
@@ -62,7 +63,7 @@ app.get('/api/me', authenticateToken, async (req, res) => {
       const empRes = await pool.query('SELECT name FROM employees WHERE username = $1', [req.user.username]);
       res.json({ role: 'employee', name: empRes.rows[0]?.name });
     }
-  } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
+  } catch (err) { res.status(500).json({ error: 'Ошибка профиля' }); }
 });
 
 app.put('/api/me', authenticateToken, async (req, res) => {
@@ -76,22 +77,26 @@ app.put('/api/me', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
 });
 
-// === ДАШБОРД (ИСПРАВЛЕННЫЙ ПОДСЧЕТ И ДАТЫ) ===
+// === ДАШБОРД (ИДЕАЛЬНАЯ ЛОГИКА ДАТ) ===
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
   try {
     const period = req.query.period || 'today';
-    let dateFilter = "created_at >= CURRENT_DATE"; 
-    if (period === 'week') dateFilter = "created_at >= CURRENT_DATE - INTERVAL '7 days'";
-    if (period === 'month') dateFilter = "created_at >= CURRENT_DATE - INTERVAL '30 days'";
+    let dateFilter = "s.created_at >= CURRENT_DATE"; 
+    if (period === 'week') dateFilter = "s.created_at >= CURRENT_DATE - INTERVAL '7 days'";
+    if (period === 'month') dateFilter = "s.created_at >= CURRENT_DATE - INTERVAL '30 days'";
 
     const result = await pool.query(`
-      SELECT COALESCE(SUM(total_price), 0) as total_revenue, COUNT(id) as total_checks 
-      FROM sales 
-      WHERE store_id IN (SELECT id FROM stores WHERE owner_id = $1) AND ${dateFilter};
+      SELECT COALESCE(SUM(s.total_price), 0) as total_revenue, COUNT(s.id) as total_checks 
+      FROM sales s 
+      JOIN stores st ON s.store_id = st.id 
+      WHERE st.owner_id = $1 AND ${dateFilter};
     `, [req.user.owner_id]);
     
     res.json({ revenue: Number(result.rows[0].total_revenue), checks: Number(result.rows[0].total_checks) });
-  } catch (err) { res.status(500).json({ error: 'Ошибка дашборда' }); }
+  } catch (err) { 
+    console.error("DASHBOARD ERROR:", err);
+    res.status(500).json({ error: 'Ошибка дашборда' }); 
+  }
 });
 
 // === СЕТЬ И СОТРУДНИКИ ===
@@ -106,7 +111,7 @@ app.get('/api/stores', authenticateToken, async (req, res) => {
       FROM stores s WHERE s.owner_id = $1 ORDER BY s.id ASC;
     `, [req.user.owner_id]);
     res.json(result.rows);
-  } catch (err) { res.status(500).json({ error: 'Ошибка сети' }); }
+  } catch (err) { console.error("STORES ERR:", err); res.status(500).json({ error: 'Ошибка сети' }); }
 });
 
 app.post('/api/stores', authenticateToken, async (req, res) => {
@@ -187,7 +192,7 @@ app.get('/api/finance', authenticateToken, async (req, res) => {
     const actualCash = cash - (Number(expRes.rows[0].total) || 0);
     const supRes = await pool.query(`SELECT id, name, debt FROM suppliers WHERE owner_id = $1 ORDER BY id ASC`, [req.user.owner_id]);
     res.json({ total_balance: actualCash + card, cash: actualCash, card: card, suppliers: supRes.rows });
-  } catch (err) { res.status(500).json({ error: 'Ошибка финансов' }); }
+  } catch (err) { console.error("FINANCE ERR:", err); res.status(500).json({ error: 'Ошибка финансов' }); }
 });
 
 app.post('/api/finance/expense', authenticateToken, async (req, res) => {
