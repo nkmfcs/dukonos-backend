@@ -50,34 +50,23 @@ app.post('/api/register', async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка регистрации' }); }
 });
 
-// УМНЫЙ ЛОГИН: Различаем CEO и Кассира
 app.post('/api/login', async (req, res) => {
-  const { email, password } = req.body; // 'email' теперь может быть логином кассира
+  const { email, password } = req.body; 
   try {
-    // 1. Пытаемся найти Владельца
     let userRes = await pool.query('SELECT * FROM owners WHERE email = $1', [email]);
     if (userRes.rows.length > 0) {
       const owner = userRes.rows[0];
       const validPassword = await bcrypt.compare(password, owner.password_hash);
       if (!validPassword) return res.status(401).json({ error: 'Неверный пароль' });
-      // Даем токен с ролью 'owner'
       const token = jwt.sign({ owner_id: owner.id, role: 'owner', email: owner.email }, process.env.JWT_SECRET, { expiresIn: '7d' });
       return res.json({ token: token, role: 'owner', message: 'Вход CEO!' });
     }
 
-    // 2. Если не Владелец, ищем Кассира (по username)
-    let empRes = await pool.query(`
-      SELECT e.*, s.owner_id 
-      FROM employees e 
-      JOIN stores s ON e.store_id = s.id 
-      WHERE e.username = $1
-    `, [email]);
-    
+    let empRes = await pool.query(`SELECT e.*, s.owner_id FROM employees e JOIN stores s ON e.store_id = s.id WHERE e.username = $1`, [email]);
     if (empRes.rows.length > 0) {
       const emp = empRes.rows[0];
       const validPassword = await bcrypt.compare(password, emp.password_hash);
       if (!validPassword) return res.status(401).json({ error: 'Неверный пароль' });
-      // Даем токен с ролью 'employee'
       const token = jwt.sign({ owner_id: emp.owner_id, store_id: emp.store_id, role: 'employee', username: emp.username }, process.env.JWT_SECRET, { expiresIn: '7d' });
       return res.json({ token: token, role: 'employee', message: 'Вход Кассира!' });
     }
@@ -88,19 +77,42 @@ app.post('/api/login', async (req, res) => {
 
 // === ЗАКРЫТЫЕ МАРШРУТЫ ===
 
-// НОВЫЙ МАРШРУТ: Создание кассира (Только для CEO)
-// НОВЫЙ МАРШРУТ: Создание кассира (Только для CEO)
+app.get('/api/me', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role === 'owner') {
+      const ownerRes = await pool.query('SELECT name, email, phone FROM owners WHERE id = $1', [req.user.owner_id]);
+      const storeRes = await pool.query('SELECT name as store_name FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id]);
+      res.json({ role: 'owner', ...ownerRes.rows[0], store_name: storeRes.rows[0]?.store_name || 'Мой магазин' });
+    } else {
+      const empRes = await pool.query('SELECT name, username FROM employees WHERE username = $1', [req.user.username]);
+      const storeRes = await pool.query('SELECT name as store_name FROM stores WHERE id = $1', [req.user.store_id]);
+      res.json({ role: 'employee', ...empRes.rows[0], store_name: storeRes.rows[0]?.store_name || 'Магазин' });
+    }
+  } catch (err) { res.status(500).json({ error: 'Ошибка загрузки профиля' }); }
+});
+
+app.put('/api/me', authenticateToken, async (req, res) => {
+  const { name, phone, store_name } = req.body;
+  try {
+    if (req.user.role === 'owner') {
+      await pool.query('UPDATE owners SET name = $1, phone = $2 WHERE id = $3', [name, phone, req.user.owner_id]);
+      if (store_name) {
+        await pool.query('UPDATE stores SET name = $1 WHERE owner_id = $2', [store_name, req.user.owner_id]);
+      }
+      res.json({ message: 'Профиль успешно обновлен!' });
+    } else {
+      res.status(403).json({ error: 'Кассир не может менять настройки магазина' });
+    }
+  } catch (err) { res.status(500).json({ error: 'Ошибка обновления' }); }
+});
+
 app.post('/api/employees', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только владелец может добавлять сотрудников' });
   const { name, username, password } = req.body;
   const owner_id = req.user.owner_id;
   try {
     const storeRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [owner_id]);
-    
-    // ПРОВЕРКА: А есть ли вообще магазин у этого владельца?
-    if (storeRes.rows.length === 0) {
-        return res.status(400).json({ error: 'У вас нет привязанного магазина! Создайте новый аккаунт.' });
-    }
+    if (storeRes.rows.length === 0) return res.status(400).json({ error: 'У вас нет привязанного магазина! Создайте новый аккаунт.' });
     const store_id = storeRes.rows[0].id;
 
     const salt = await bcrypt.genSalt(10);
@@ -113,45 +125,8 @@ app.post('/api/employees', authenticateToken, async (req, res) => {
     res.json({ message: 'Кассир успешно создан!' });
   } catch (err) { 
     console.error("ОШИБКА СОЗДАНИЯ КАССИРА:", err);
-    // ТЕПЕРЬ СЕРВЕР ОТПРАВИТ НАМ РЕАЛЬНЫЙ ТЕКСТ ОШИБКИ ИЗ БАЗЫ ДАННЫХ
     res.status(500).json({ error: 'Техническая ошибка: ' + err.message }); 
   }
-});
-
-// ПОЛУЧИТЬ ДАННЫЕ ТЕКУЩЕГО ПРОФИЛЯ
-app.get('/api/me', authenticateToken, async (req, res) => {
-  try {
-    if (req.user.role === 'owner') {
-      const ownerRes = await pool.query('SELECT name, email, phone FROM owners WHERE id = $1', [req.user.owner_id]);
-      const storeRes = await pool.query('SELECT name as store_name FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id]);
-      res.json({ role: 'owner', ...ownerRes.rows[0], store_name: storeRes.rows[0]?.store_name || 'Мой магазин' });
-    } else {
-      // Если это кассир
-      const empRes = await pool.query('SELECT name, username FROM employees WHERE username = $1', [req.user.username]);
-      const storeRes = await pool.query('SELECT name as store_name FROM stores WHERE id = $1', [req.user.store_id]);
-      res.json({ role: 'employee', ...empRes.rows[0], store_name: storeRes.rows[0]?.store_name || 'Магазин' });
-    }
-  } catch (err) { 
-    res.status(500).json({ error: 'Ошибка загрузки профиля' }); 
-  }
-});
-
-// ОБНОВЛЕНИЕ ПРОФИЛЯ (Смена ФИО и названия магазина)
-app.put('/api/me', authenticateToken, async (req, res) => {
-  const { name, phone, store_name } = req.body;
-  try {
-    if (req.user.role === 'owner') {
-      // Обновляем данные владельца
-      await pool.query('UPDATE owners SET name = $1, phone = $2 WHERE id = $3', [name, phone, req.user.owner_id]);
-      // Обновляем название магазина
-      if (store_name) {
-        await pool.query('UPDATE stores SET name = $1 WHERE owner_id = $2', [store_name, req.user.owner_id]);
-      }
-      res.json({ message: 'Профиль успешно обновлен!' });
-    } else {
-      res.status(403).json({ error: 'Кассир не может менять настройки магазина' });
-    }
-  } catch (err) { res.status(500).json({ error: 'Ошибка обновления' }); }
 });
 
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
@@ -200,21 +175,43 @@ app.post('/api/sell', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка сервера' }); }
 });
 
-// УДАЛЕНИЕ ТОВАРА (Только для владельца)
 app.delete('/api/products/:id', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только владелец может удалять товары' });
   const productId = req.params.id;
-  
   try {
-    // Сначала удаляем со склада (inventory), затем саму карточку товара (products)
     await pool.query('DELETE FROM inventory WHERE product_id = $1', [productId]);
     await pool.query('DELETE FROM products WHERE id = $1 AND owner_id = $2', [productId, req.user.owner_id]);
-    
     res.json({ message: 'Товар успешно удален!' });
-  } catch (err) { 
-    console.error(err); 
-    res.status(500).json({ error: 'Ошибка при удалении товара' }); 
-  }
+  } catch (err) { res.status(500).json({ error: 'Ошибка при удалении товара' }); }
+});
+
+// === УПРАВЛЕНИЕ СЕТЬЮ (МАГАЗИНЫ) ===
+app.get('/api/stores', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
+  try {
+    const result = await pool.query(`
+      SELECT 
+        s.id, s.name, s.location,
+        (SELECT COUNT(*) FROM employees WHERE store_id = s.id) as emp_count,
+        COALESCE((SELECT SUM(total_price) FROM sales WHERE store_id = s.id), 0) as total_revenue
+      FROM stores s
+      WHERE s.owner_id = $1
+      ORDER BY s.id ASC;
+    `, [req.user.owner_id]);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: 'Ошибка загрузки магазинов' }); }
+});
+
+app.post('/api/stores', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
+  const { name, location } = req.body;
+  try {
+    await pool.query(
+      'INSERT INTO stores (name, location, owner_id) VALUES ($1, $2, $3)', 
+      [name, location || 'Без адреса', req.user.owner_id]
+    );
+    res.json({ message: 'Новая точка успешно добавлена!' });
+  } catch (err) { res.status(500).json({ error: 'Ошибка создания магазина' }); }
 });
 
 app.listen(port, () => { console.log(`Сервер запущен на ${port}`); });
