@@ -108,6 +108,24 @@ app.post('/api/employees', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка создания кассира (Возможно логин занят)' }); }
 });
 
+// ПОЛУЧИТЬ ДАННЫЕ ТЕКУЩЕГО ПРОФИЛЯ
+app.get('/api/me', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role === 'owner') {
+      const ownerRes = await pool.query('SELECT name, email, phone FROM owners WHERE id = $1', [req.user.owner_id]);
+      const storeRes = await pool.query('SELECT name as store_name FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id]);
+      res.json({ role: 'owner', ...ownerRes.rows[0], store_name: storeRes.rows[0]?.store_name || 'Мой магазин' });
+    } else {
+      // Если это кассир
+      const empRes = await pool.query('SELECT name, username FROM employees WHERE username = $1', [req.user.username]);
+      const storeRes = await pool.query('SELECT name as store_name FROM stores WHERE id = $1', [req.user.store_id]);
+      res.json({ role: 'employee', ...empRes.rows[0], store_name: storeRes.rows[0]?.store_name || 'Магазин' });
+    }
+  } catch (err) { 
+    res.status(500).json({ error: 'Ошибка загрузки профиля' }); 
+  }
+});
+
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
   try {
     const owner_id = req.user.owner_id;
