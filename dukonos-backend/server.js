@@ -16,11 +16,10 @@ const pool = new Pool({
   password: process.env.DB_PASSWORD, port: 5432,
 });
 
-// === АВТОРИЗАЦИЯ ===
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'Нет доступа.' });
+  if (!token) return res.status(401).json({ error: 'Доступ запрещен.' });
   jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
     if (err) return res.status(403).json({ error: 'Токен истек.' });
     req.user = user; next();
@@ -66,34 +65,44 @@ app.get('/api/me', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
 });
 
-// === ДАШБОРД (ГЛАВНАЯ) ===
+app.put('/api/me', authenticateToken, async (req, res) => {
+  const { name, phone, store_name } = req.body;
+  try {
+    if (req.user.role === 'owner') {
+      await pool.query('UPDATE owners SET name = $1, phone = $2 WHERE id = $3', [name, phone, req.user.owner_id]);
+      if (store_name) await pool.query('UPDATE stores SET name = $1 WHERE owner_id = $2', [store_name, req.user.owner_id]);
+      res.json({ message: 'Обновлено!' });
+    } else { res.status(403).json({ error: 'Запрещено' }); }
+  } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
+});
+
+// === ДАШБОРД (ИСПРАВЛЕННЫЙ ПОДСЧЕТ И ДАТЫ) ===
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
   try {
     const period = req.query.period || 'today';
-    let dateFilter = "created_at::date = CURRENT_DATE"; // По умолчанию СЕГОДНЯ
+    let dateFilter = "created_at >= CURRENT_DATE"; 
     if (period === 'week') dateFilter = "created_at >= CURRENT_DATE - INTERVAL '7 days'";
     if (period === 'month') dateFilter = "created_at >= CURRENT_DATE - INTERVAL '30 days'";
 
     const result = await pool.query(`
       SELECT COALESCE(SUM(total_price), 0) as total_revenue, COUNT(id) as total_checks 
-      FROM sales s JOIN stores st ON s.store_id = st.id 
-      WHERE st.owner_id = $1 AND ${dateFilter};
+      FROM sales 
+      WHERE store_id IN (SELECT id FROM stores WHERE owner_id = $1) AND ${dateFilter};
     `, [req.user.owner_id]);
     
     res.json({ revenue: Number(result.rows[0].total_revenue), checks: Number(result.rows[0].total_checks) });
   } catch (err) { res.status(500).json({ error: 'Ошибка дашборда' }); }
 });
 
-// === СЕТЬ И МАГАЗИНЫ ===
+// === СЕТЬ И СОТРУДНИКИ ===
 app.get('/api/stores', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
   try {
-    // ВАЖНО: Считаем выручку и чеки только за СЕГОДНЯ (CURRENT_DATE)
     const result = await pool.query(`
       SELECT s.id, s.name, s.location,
         (SELECT COUNT(*) FROM employees WHERE store_id = s.id) as emp_count,
-        COALESCE((SELECT SUM(total_price) FROM sales WHERE store_id = s.id AND created_at::date = CURRENT_DATE), 0) as total_revenue,
-        (SELECT COUNT(id) FROM sales WHERE store_id = s.id AND created_at::date = CURRENT_DATE) as total_checks
+        COALESCE((SELECT SUM(total_price) FROM sales WHERE store_id = s.id AND created_at >= CURRENT_DATE), 0) as total_revenue,
+        (SELECT COUNT(id) FROM sales WHERE store_id = s.id AND created_at >= CURRENT_DATE) as total_checks
       FROM stores s WHERE s.owner_id = $1 ORDER BY s.id ASC;
     `, [req.user.owner_id]);
     res.json(result.rows);
@@ -116,12 +125,32 @@ app.get('/api/employees', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
 });
 
+app.post('/api/employees', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Запрещено' });
+  try {
+    const salt = await bcrypt.genSalt(10);
+    const hash = await bcrypt.hash(req.body.password, salt);
+    await pool.query('INSERT INTO employees (store_id, username, password_hash, name) VALUES ($1, $2, $3, $4)', [req.body.store_id, req.body.username, hash, req.body.name]);
+    res.json({ message: 'Создано' });
+  } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
+});
+
 // === ТОВАРЫ И ПРОДАЖИ ===
 app.get('/api/products', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(`SELECT p.id, p.icon, p.name, p.category, p.barcode, p.price, i.stock FROM products p JOIN inventory i ON p.id = i.product_id JOIN stores st ON i.store_id = st.id WHERE st.owner_id = $1;`, [req.user.owner_id]);
     res.json(result.rows);
   } catch (err) { res.status(500).json({ error: 'Ошибка БД' }); }
+});
+
+app.post('/api/products', authenticateToken, async (req, res) => {
+  const { barcode, name, category, price, icon, stock } = req.body;
+  try {
+    const newP = await pool.query('INSERT INTO products (barcode, name, category, price, icon, owner_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *', [barcode, name, category, price, icon, req.user.owner_id]);
+    const storeRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id]);
+    await pool.query('INSERT INTO inventory (store_id, product_id, stock) VALUES ($1, $2, $3)', [storeRes.rows[0].id, newP.rows[0].id, stock ? Number(stock) : 0]);
+    res.json(newP.rows[0]);
+  } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
 });
 
 app.post('/api/sell', authenticateToken, async (req, res) => {
@@ -138,7 +167,16 @@ app.post('/api/sell', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка сервера' }); }
 });
 
-// === ФИНАНСЫ (Именно здесь была ошибка 404) ===
+app.delete('/api/products/:id', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только владелец' });
+  try {
+    await pool.query('DELETE FROM inventory WHERE product_id = $1', [req.params.id]);
+    await pool.query('DELETE FROM products WHERE id = $1 AND owner_id = $2', [req.params.id, req.user.owner_id]);
+    res.json({ message: 'Удалено!' });
+  } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
+});
+
+// === ФИНАНСЫ ===
 app.get('/api/finance', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
   try {
@@ -150,6 +188,25 @@ app.get('/api/finance', authenticateToken, async (req, res) => {
     const supRes = await pool.query(`SELECT id, name, debt FROM suppliers WHERE owner_id = $1 ORDER BY id ASC`, [req.user.owner_id]);
     res.json({ total_balance: actualCash + card, cash: actualCash, card: card, suppliers: supRes.rows });
   } catch (err) { res.status(500).json({ error: 'Ошибка финансов' }); }
+});
+
+app.post('/api/finance/expense', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
+  try {
+    const storeRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id]);
+    await pool.query('INSERT INTO expenses (store_id, amount, category, description) VALUES ($1, $2, $3, $4)', [storeRes.rows[0].id, req.body.amount, req.body.category, req.body.description]);
+    res.json({ message: 'Расход записан' });
+  } catch (err) { res.status(500).json({ error: 'Ошибка расхода' }); }
+});
+
+app.post('/api/suppliers/pay', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
+  try {
+    await pool.query('UPDATE suppliers SET debt = GREATEST(debt - $1, 0) WHERE id = $2 AND owner_id = $3', [req.body.amount, req.body.supplier_id, req.user.owner_id]);
+    const storeRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id]);
+    await pool.query('INSERT INTO expenses (store_id, amount, category, description) VALUES ($1, $2, $3, $4)', [storeRes.rows[0].id, req.body.amount, 'Оплата поставщику', 'Погашение долга']);
+    res.json({ message: 'Оплата прошла' });
+  } catch (err) { res.status(500).json({ error: 'Ошибка оплаты' }); }
 });
 
 app.listen(port, () => { console.log(`Сервер запущен на ${port}`); });
