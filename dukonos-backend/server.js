@@ -68,16 +68,12 @@ app.get('/api/me', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка профиля' }); }
 });
 
-// Сохранение изменений из Профиля (profile.html)
 app.put('/api/me', authenticateToken, async (req, res) => {
   try {
     const { name, phone, store_name } = req.body;
     
     if (req.user.role === 'owner') {
-      // Обновляем имя и телефон владельца
       await pool.query('UPDATE owners SET name = $1, phone = $2 WHERE id = $3', [name, phone, req.user.owner_id]);
-      
-      // Если передали название магазина, обновим главную (первую) точку
       if (store_name) {
          const firstStore = await pool.query('SELECT id FROM stores WHERE owner_id = $1 ORDER BY id ASC LIMIT 1', [req.user.owner_id]);
          if (firstStore.rows.length > 0) {
@@ -86,7 +82,6 @@ app.put('/api/me', authenticateToken, async (req, res) => {
       }
       res.json({ message: 'Профиль успешно обновлен' });
     } else {
-      // Обновляем данные сотрудника (кассира)
       await pool.query('UPDATE employees SET name = $1, phone = $2 WHERE username = $3', [name, phone, req.user.username]);
       res.json({ message: 'Профиль успешно обновлен' });
     }
@@ -220,14 +215,10 @@ app.post('/api/stores', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
 });
 
-// === ОБНОВЛЕНИЕ НАЗВАНИЯ МАГАЗИНА ===
 app.put('/api/stores/:id', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
   const { name } = req.body;
-  
-  if (!name || name.trim() === '') {
-    return res.status(400).json({ error: 'Название не может быть пустым' });
-  }
+  if (!name || name.trim() === '') return res.status(400).json({ error: 'Название не может быть пустым' });
 
   try {
     await pool.query('UPDATE stores SET name = $1 WHERE id = $2 AND owner_id = $3', [name.trim(), req.params.id, req.user.owner_id]);
@@ -344,7 +335,7 @@ app.post('/api/inventory/update', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка обновления инвентаря' }); }
 });
 
-// === ПРОДАЖИ (ОБНОВЛЕННЫЙ МАРШРУТ С КОРЗИНОЙ И ТРАНЗАКЦИЯМИ) ===
+// === ПРОДАЖИ ===
 app.post('/api/sell', authenticateToken, async (req, res) => {
   const { cart, payment_method } = req.body; 
   
@@ -356,7 +347,6 @@ app.post('/api/sell', authenticateToken, async (req, res) => {
         store_id = (await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id])).rows[0].id; 
     }
     
-    // === ГЕНЕРАЦИЯ ПОРЯДКОВОГО НОМЕРА ЧЕКА (ГГММ-ХХХХ) ===
     const now = new Date();
     const yy = String(now.getFullYear()).slice(-2);
     const mm = String(now.getMonth() + 1).padStart(2, '0');
@@ -369,7 +359,6 @@ app.post('/api/sell', authenticateToken, async (req, res) => {
     
     const nextNum = parseInt(countRes.rows[0].current_count) + 1;
     const receipt_id = `${monthPrefix}-${String(nextNum).padStart(4, '0')}`; 
-    // ====================================================
 
     await pool.query('BEGIN');
 
@@ -404,7 +393,6 @@ app.delete('/api/products/:id', authenticateToken, async (req, res) => {
 });
 
 // === ПОСТАВЩИКИ (КОМПАНИИ) ===
-// Получить всех поставщиков
 app.get('/api/suppliers', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Доступ запрещен' });
   try {
@@ -413,7 +401,6 @@ app.get('/api/suppliers', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка загрузки поставщиков' }); }
 });
 
-// Добавить нового поставщика
 app.post('/api/suppliers', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Доступ запрещен' });
   const { name, phone, visit_days } = req.body;
@@ -426,18 +413,21 @@ app.post('/api/suppliers', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка сервера' }); }
 });
 
-app.post('/api/suppliers', authenticateToken, async (req, res) => {
+app.post('/api/suppliers/pay', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
-  const { name, phone, visit_days } = req.body;
+  const { amount, supplier_id } = req.body;
+  
   try {
-    await pool.query(
-      'INSERT INTO suppliers (name, phone, visit_days, debt, owner_id) VALUES ($1, $2, $3, 0, $4)', 
-      [name, phone, visit_days, req.user.owner_id]
-    );
-    res.json({ message: 'Поставщик успешно добавлен!' });
-  } catch (err) { 
+    await pool.query('UPDATE suppliers SET debt = debt - $1 WHERE id = $2 AND owner_id = $3', [amount, supplier_id, req.user.owner_id]);
+    
+    const storeRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id]);
+    const desc = 'Оплата долга поставщику #' + supplier_id;
+    await pool.query('INSERT INTO expenses (store_id, amount, category, description) VALUES ($1, $2, $3, $4)', [storeRes.rows[0].id, amount, 'Оплата поставщикам', desc]);
+    
+    res.json({ message: 'Долг погашен' });
+  } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Ошибка при добавлении поставщика' }); 
+    res.status(500).json({ error: 'Ошибка оплаты поставщику' });
   }
 });
 
@@ -450,7 +440,8 @@ app.get('/api/finance', authenticateToken, async (req, res) => {
     salesRes.rows.forEach(r => { if (r.payment_method === 'card') card += Number(r.total); else cash += Number(r.total); });
     const expRes = await pool.query(`SELECT SUM(amount) as total FROM expenses e JOIN stores st ON e.store_id = st.id WHERE st.owner_id = $1`, [req.user.owner_id]);
     const actualCash = cash - (Number(expRes.rows[0].total) || 0);
-    const supRes = await pool.query(`SELECT id, name, debt, phone, visit_days FROM suppliers WHERE owner_id = $1 ORDER BY id ASC`, [req.user.owner_id]);    res.json({ total_balance: actualCash + card, cash: actualCash, card: card, suppliers: supRes.rows });
+    const supRes = await pool.query(`SELECT id, name, debt, phone, visit_days FROM suppliers WHERE owner_id = $1 ORDER BY id ASC`, [req.user.owner_id]);
+    res.json({ total_balance: actualCash + card, cash: actualCash, card: card, suppliers: supRes.rows });
   } catch (err) { res.status(500).json({ error: 'Ошибка финансов' }); }
 });
 
