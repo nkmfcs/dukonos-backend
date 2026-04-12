@@ -66,13 +66,12 @@ app.get('/api/me', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка профиля' }); }
 });
 
-// === СЕТЬ И МАГАЗИНЫ ===
+// === ДАШБОРД ===
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
   try {
     const period = req.query.period || 'today';
     const ownerId = req.user.owner_id;
 
-    // 1. Определяем фильтры дат по умолчанию (для 'today')
     let dateFilter = "s.created_at >= CURRENT_DATE";
     let prevDateFilter = "s.created_at >= CURRENT_DATE - INTERVAL '1 day' AND s.created_at < CURRENT_DATE";
     
@@ -84,12 +83,10 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
         prevDateFilter = "s.created_at >= CURRENT_DATE - INTERVAL '60 days' AND s.created_at < CURRENT_DATE - INTERVAL '30 days'";
     }
 
-    // 2. Текущая выручка и чеки
     const currentStats = await pool.query(`SELECT COALESCE(SUM(s.total_price), 0) as total_revenue, COUNT(DISTINCT s.receipt_id) as total_checks FROM sales s JOIN stores st ON s.store_id = st.id WHERE st.owner_id = $1 AND ${dateFilter}`, [ownerId]);
     const revenue = Number(currentStats.rows[0].total_revenue);
     const checks = Number(currentStats.rows[0].total_checks);
 
-    // 3. Прошлая выручка и чеки (считаем зеленые/красные проценты)
     const prevStats = await pool.query(`SELECT COALESCE(SUM(s.total_price), 0) as total_revenue, COUNT(DISTINCT s.receipt_id) as total_checks FROM sales s JOIN stores st ON s.store_id = st.id WHERE st.owner_id = $1 AND ${prevDateFilter}`, [ownerId]);
     const prevRevenue = Number(prevStats.rows[0].total_revenue);
     const prevChecks = Number(prevStats.rows[0].total_checks);
@@ -97,14 +94,12 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
     const revenueTrend = prevRevenue === 0 ? (revenue > 0 ? 100 : 0) : Math.round(((revenue - prevRevenue) / prevRevenue) * 100);
     const checksTrend = prevChecks === 0 ? (checks > 0 ? 100 : 0) : Math.round(((checks - prevChecks) / prevChecks) * 100);
 
-    // 4. Заканчивающиеся товары (Меньше или равно 10 штук на всю сеть)
     const lowStockRes = await pool.query(`
         SELECT p.name, SUM(i.stock) as stock 
         FROM products p JOIN inventory i ON p.id = i.product_id JOIN stores st ON i.store_id = st.id 
         WHERE st.owner_id = $1 GROUP BY p.name HAVING SUM(i.stock) <= 10 ORDER BY stock ASC LIMIT 3
     `, [ownerId]);
 
-    // 5. Топ 3 продаваемых товаров
     const topSalesRes = await pool.query(`
         SELECT p.name, p.icon, SUM(s.total_price) as total_sum 
         FROM sales s JOIN products p ON s.product_id = p.id JOIN stores st ON s.store_id = st.id 
@@ -112,7 +107,6 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
         GROUP BY p.name, p.icon ORDER BY total_sum DESC LIMIT 3
     `, [ownerId]);
 
-    // 6. Последние 4 операции (чека) в кассе
     const recentLogsRes = await pool.query(`
         SELECT s.receipt_id, SUM(s.total_price) as total_price, TO_CHAR(MIN(s.created_at), 'HH24:MI') as time 
         FROM sales s JOIN stores st ON s.store_id = st.id 
@@ -120,7 +114,6 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
         GROUP BY s.receipt_id ORDER BY MIN(s.created_at) DESC LIMIT 4
     `, [ownerId]);
 
-    // 7. Сборка точек для графика (Математика осей X и Y)
     const rawSales = await pool.query(`
         SELECT s.total_price, s.created_at 
         FROM sales s JOIN stores st ON s.store_id = st.id 
@@ -143,7 +136,7 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
         chartData.labels = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
         chartData.values = [0, 0, 0, 0, 0, 0, 0];
         rawSales.rows.forEach(row => {
-            let day = new Date(row.created_at).getDay(); // 0 = Вс, 1 = Пн
+            let day = new Date(row.created_at).getDay();
             let index = day === 0 ? 6 : day - 1; 
             chartData.values[index] += Number(row.total_price);
         });
@@ -176,7 +169,7 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
   }
 });
 
-// ВОТ ТОТ САМЫЙ ПРОПАВШИЙ МАРШРУТ
+// === СЕТЬ И МАГАЗИНЫ ===
 app.get('/api/stores', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
   try {
@@ -337,15 +330,13 @@ app.post('/api/sell', authenticateToken, async (req, res) => {
     const now = new Date();
     const yy = String(now.getFullYear()).slice(-2);
     const mm = String(now.getMonth() + 1).padStart(2, '0');
-    const monthPrefix = `${yy}${mm}`; // Получится например "2604"
+    const monthPrefix = `${yy}${mm}`;
 
-    // Считаем, сколько чеков уже было выбито в этом месяце в этом магазине
     const countRes = await pool.query(
         `SELECT COUNT(DISTINCT receipt_id) as current_count FROM sales WHERE store_id = $1 AND receipt_id LIKE $2`, 
         [store_id, `${monthPrefix}-%`]
     );
     
-    // Прибавляем 1 и форматируем (чтобы было 0001, 0002 и т.д.)
     const nextNum = parseInt(countRes.rows[0].current_count) + 1;
     const receipt_id = `${monthPrefix}-${String(nextNum).padStart(4, '0')}`; 
     // ====================================================
