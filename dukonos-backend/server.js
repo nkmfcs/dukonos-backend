@@ -54,16 +54,46 @@ app.post('/api/login', async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка входа' }); }
 });
 
+// === ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ ===
 app.get('/api/me', authenticateToken, async (req, res) => {
   try {
     if (req.user.role === 'owner') {
-      const ownerRes = await pool.query('SELECT name FROM owners WHERE id = $1', [req.user.owner_id]);
-      res.json({ role: 'owner', name: ownerRes.rows[0]?.name });
+      const ownerRes = await pool.query('SELECT name, phone FROM owners WHERE id = $1', [req.user.owner_id]);
+      const storeRes = await pool.query('SELECT name FROM stores WHERE owner_id = $1 ORDER BY id ASC LIMIT 1', [req.user.owner_id]);
+      res.json({ role: 'owner', name: ownerRes.rows[0]?.name, phone: ownerRes.rows[0]?.phone, store_name: storeRes.rows[0]?.name });
     } else {
-      const empRes = await pool.query('SELECT e.name, s.name as store_name FROM employees e JOIN stores s ON e.store_id = s.id WHERE e.username = $1', [req.user.username]);
-      res.json({ role: 'employee', name: empRes.rows[0]?.name, store_name: empRes.rows[0]?.store_name });
+      const empRes = await pool.query('SELECT e.name, e.phone, s.name as store_name FROM employees e JOIN stores s ON e.store_id = s.id WHERE e.username = $1', [req.user.username]);
+      res.json({ role: 'employee', name: empRes.rows[0]?.name, phone: empRes.rows[0]?.phone, store_name: empRes.rows[0]?.store_name });
     }
   } catch (err) { res.status(500).json({ error: 'Ошибка профиля' }); }
+});
+
+// Сохранение изменений из Профиля (profile.html)
+app.put('/api/me', authenticateToken, async (req, res) => {
+  try {
+    const { name, phone, store_name } = req.body;
+    
+    if (req.user.role === 'owner') {
+      // Обновляем имя и телефон владельца
+      await pool.query('UPDATE owners SET name = $1, phone = $2 WHERE id = $3', [name, phone, req.user.owner_id]);
+      
+      // Если передали название магазина, обновим главную (первую) точку
+      if (store_name) {
+         const firstStore = await pool.query('SELECT id FROM stores WHERE owner_id = $1 ORDER BY id ASC LIMIT 1', [req.user.owner_id]);
+         if (firstStore.rows.length > 0) {
+             await pool.query('UPDATE stores SET name = $1 WHERE id = $2', [store_name, firstStore.rows[0].id]);
+         }
+      }
+      res.json({ message: 'Профиль успешно обновлен' });
+    } else {
+      // Обновляем данные сотрудника (кассира)
+      await pool.query('UPDATE employees SET name = $1, phone = $2 WHERE username = $3', [name, phone, req.user.username]);
+      res.json({ message: 'Профиль успешно обновлен' });
+    }
+  } catch (err) {
+    console.error('Ошибка обновления профиля:', err);
+    res.status(500).json({ error: 'Ошибка обновления профиля' });
+  }
 });
 
 // === ДАШБОРД ===
