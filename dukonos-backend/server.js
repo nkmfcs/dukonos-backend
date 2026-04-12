@@ -26,6 +26,7 @@ function authenticateToken(req, res, next) {
   });
 }
 
+// === АВТОРИЗАЦИЯ И ПРОФИЛЬ ===
 app.post('/api/register', async (req, res) => {
   const { email, password } = req.body;
   try {
@@ -44,6 +45,7 @@ app.post('/api/login', async (req, res) => {
       if (!await bcrypt.compare(password, userRes.rows[0].password_hash)) return res.status(401).json({ error: 'Неверный пароль' });
       return res.json({ token: jwt.sign({ owner_id: userRes.rows[0].id, role: 'owner' }, process.env.JWT_SECRET, { expiresIn: '7d' }), role: 'owner' });
     }
+    
     let empRes = await pool.query('SELECT e.*, s.owner_id FROM employees e JOIN stores s ON e.store_id = s.id WHERE e.username = $1', [email]);
     if (empRes.rows.length > 0) {
       if (!await bcrypt.compare(password, empRes.rows[0].password_hash)) return res.status(401).json({ error: 'Неверный пароль' });
@@ -65,6 +67,7 @@ app.get('/api/me', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка профиля' }); }
 });
 
+// === ДАШБОРД И СЕТЬ ===
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
   try {
     const period = req.query.period || 'today';
@@ -81,7 +84,6 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка дашборда' }); }
 });
 
-// === ИСПРАВЛЕННЫЙ МАРШРУТ: ТЕПЕРЬ ПОДДЕРЖИВАЕТ ФИЛЬТР ПО ДАТАМ ===
 app.get('/api/stores', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
   try {
@@ -131,7 +133,7 @@ app.post('/api/employees', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
 });
 
-// === ИСПРАВЛЕННЫЙ МАРШРУТ ЛОГОВ: ФИЛЬТР ПО ДАТАМ ===
+// === ЛОГИ И ИСТОРИЯ ===
 app.get('/api/logs/:store_id', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
   try {
@@ -169,6 +171,7 @@ app.get('/api/logs_all', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка логов' }); }
 });
 
+// === ТОВАРЫ И ПРОДАЖИ ===
 app.get('/api/products', authenticateToken, async (req, res) => {
   try {
     if (req.user.role === 'employee') {
@@ -182,57 +185,28 @@ app.get('/api/products', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка БД' }); }
 });
 
-// === ОБНОВЛЕННЫЙ МАРШРУТ ДОБАВЛЕНИЯ ТОВАРА ===
+// НОВАЯ ЛОГИКА ДОБАВЛЕНИЯ ТОВАРА С КОЛИЧЕСТВОМ
 app.post('/api/products', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только владелец' });
+  const { name, category, price, icon, target_store_id, stock } = req.body; 
+  const initialStock = parseInt(stock) || 0; // Считываем введенное количество
   
-  // Добавили target_store_id
-  const { name, category, price, icon, target_store_id } = req.body; 
   try {
     const newP = await pool.query('INSERT INTO products (name, category, price, icon, owner_id) VALUES ($1, $2, $3, $4, $5) RETURNING *', [name, category, price, icon || '📦', req.user.owner_id]);
     const productId = newP.rows[0].id;
 
     if (target_store_id) {
-        // Товар добавлен из вкладки "Инвентаризация" - привязываем ТОЛЬКО к этому магазину
-        await pool.query('INSERT INTO inventory (store_id, product_id, stock) VALUES ($1, $2, $3)', [target_store_id, productId, 0]);
+        // Привязываем только к ОДНОМУ магазину
+        await pool.query('INSERT INTO inventory (store_id, product_id, stock) VALUES ($1, $2, $3)', [target_store_id, productId, initialStock]);
     } else {
-        // Товар добавлен из "Базы товаров" - привязываем ко ВСЕМ магазинам сети
+        // Привязываем КО ВСЕМ магазинам
         const storesRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1', [req.user.owner_id]);
         for (let store of storesRes.rows) {
-            await pool.query('INSERT INTO inventory (store_id, product_id, stock) VALUES ($1, $2, $3)', [store.id, productId, 0]);
+            await pool.query('INSERT INTO inventory (store_id, product_id, stock) VALUES ($1, $2, $3)', [store.id, productId, initialStock]);
         }
     }
     res.json(newP.rows[0]);
   } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
-});
-
-// === НОВЫЕ МАРШРУТЫ ИНВЕНТАРИЗАЦИИ ===
-app.get('/api/inventory/:store_id', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
-  try {
-    // Берем только те товары, которые физически привязаны к выбранной точке
-    const result = await pool.query(`
-      SELECT p.id as product_id, p.name, p.category, p.icon, p.price, i.stock 
-      FROM products p 
-      JOIN inventory i ON p.id = i.product_id 
-      WHERE i.store_id = $1 AND p.owner_id = $2
-      ORDER BY p.id DESC;
-    `, [req.params.store_id, req.user.owner_id]);
-    res.json(result.rows);
-  } catch (err) { res.status(500).json({ error: 'Ошибка получения инвентаря' }); }
-});
-
-app.post('/api/inventory/update', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
-  const { store_id, inventory } = req.body; 
-  try {
-    for (let item of inventory) {
-        await pool.query(`
-            UPDATE inventory SET stock = $1 WHERE store_id = $2 AND product_id = $3
-        `, [item.stock, store_id, item.product_id]);
-    }
-    res.json({ message: 'Остатки успешно обновлены' });
-  } catch (err) { res.status(500).json({ error: 'Ошибка обновления инвентаря' }); }
 });
 
 app.post('/api/sell', authenticateToken, async (req, res) => {
@@ -265,6 +239,35 @@ app.delete('/api/products/:id', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
 });
 
+// === ИНВЕНТАРИЗАЦИЯ ===
+app.get('/api/inventory/:store_id', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
+  try {
+    const result = await pool.query(`
+      SELECT p.id as product_id, p.name, p.category, p.icon, p.price, i.stock 
+      FROM products p 
+      JOIN inventory i ON p.id = i.product_id 
+      WHERE i.store_id = $1 AND p.owner_id = $2
+      ORDER BY p.id DESC;
+    `, [req.params.store_id, req.user.owner_id]);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: 'Ошибка получения инвентаря' }); }
+});
+
+app.post('/api/inventory/update', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
+  const { store_id, inventory } = req.body; 
+  try {
+    for (let item of inventory) {
+        await pool.query(`
+            UPDATE inventory SET stock = $1 WHERE store_id = $2 AND product_id = $3
+        `, [item.stock, store_id, item.product_id]);
+    }
+    res.json({ message: 'Остатки успешно обновлены' });
+  } catch (err) { res.status(500).json({ error: 'Ошибка обновления инвентаря' }); }
+});
+
+// === ФИНАНСЫ ===
 app.get('/api/finance', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
   try {
@@ -285,36 +288,6 @@ app.post('/api/finance/expense', authenticateToken, async (req, res) => {
     await pool.query('INSERT INTO expenses (store_id, amount, category, description) VALUES ($1, $2, $3, $4)', [storeRes.rows[0].id, req.body.amount, req.body.category, req.body.description]);
     res.json({ message: 'Расход записан' });
   } catch (err) { res.status(500).json({ error: 'Ошибка расхода' }); }
-});
-// --- ИНВЕНТАРИЗАЦИЯ (ПОЛУЧИТЬ ОСТАТКИ ДЛЯ МАГАЗИНА) ---
-app.get('/api/inventory/:store_id', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
-  try {
-    const result = await pool.query(`
-      SELECT p.id as product_id, p.name, p.icon, p.price, i.stock 
-      FROM products p 
-      JOIN inventory i ON p.id = i.product_id 
-      WHERE i.store_id = $1 AND p.owner_id = $2
-      ORDER BY p.name ASC;
-    `, [req.params.store_id, req.user.owner_id]);
-    res.json(result.rows);
-  } catch (err) { res.status(500).json({ error: 'Ошибка получения инвентаря' }); }
-});
-
-// --- ИНВЕНТАРИЗАЦИЯ (СОХРАНИТЬ НОВЫЕ ОСТАТКИ) ---
-app.post('/api/inventory/update', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
-  const { store_id, inventory } = req.body; 
-  try {
-    for (let item of inventory) {
-        await pool.query(`
-            UPDATE inventory 
-            SET stock = $1 
-            WHERE store_id = $2 AND product_id = $3
-        `, [item.stock, store_id, item.product_id]);
-    }
-    res.json({ message: 'Остатки успешно обновлены' });
-  } catch (err) { res.status(500).json({ error: 'Ошибка обновления инвентаря' }); }
 });
 
 app.listen(port, () => { console.log(`Сервер запущен на ${port}`); });
