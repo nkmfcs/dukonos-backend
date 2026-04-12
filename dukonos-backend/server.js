@@ -70,24 +70,114 @@ app.get('/api/me', authenticateToken, async (req, res) => {
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
   try {
     const period = req.query.period || 'today';
-    let dateFilter = "s.created_at >= CURRENT_DATE"; 
-    if (period === 'week') dateFilter = "s.created_at >= CURRENT_DATE - INTERVAL '7 days'";
-    if (period === 'month') dateFilter = "s.created_at >= CURRENT_DATE - INTERVAL '30 days'";
-    const result = await pool.query(`SELECT COALESCE(SUM(s.total_price), 0) as total_revenue, COUNT(DISTINCT s.receipt_id) as total_checks FROM sales s JOIN stores st ON s.store_id = st.id WHERE st.owner_id = $1 AND ${dateFilter};`, [req.user.owner_id]);
-    res.json({ revenue: Number(result.rows[0].total_revenue), checks: Number(result.rows[0].total_checks) });
-  } catch (err) { res.status(500).json({ error: 'Ошибка дашборда' }); }
-});
+    const ownerId = req.user.owner_id;
 
-app.get('/api/stores', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
-  try {
-    const dateParam = req.query.date;
-    let dateCondition = "created_at >= CURRENT_DATE";
-    let queryParams = [req.user.owner_id];
-    if (dateParam) { dateCondition = "DATE(created_at) = $2"; queryParams.push(dateParam); }
-    const result = await pool.query(`SELECT s.id, s.name, s.location, (SELECT COUNT(*) FROM employees WHERE store_id = s.id) as emp_count, COALESCE((SELECT SUM(total_price) FROM sales WHERE store_id = s.id AND ${dateCondition}), 0) as total_revenue, (SELECT COUNT(DISTINCT receipt_id) FROM sales WHERE store_id = s.id AND ${dateCondition}) as total_checks FROM stores s WHERE s.owner_id = $1 ORDER BY s.id ASC;`, queryParams);
-    res.json(result.rows);
-  } catch (err) { res.status(500).json({ error: 'Ошибка сети' }); }
+    // 1. Определяем фильтры дат для текущего и прошлого периодов (для трендов)
+    let dateFilter = "";
+    let prevDateFilter = "";
+    
+    if (period === 'today') {
+        dateFilter = "s.created_at >= CURRENT_DATE";
+        prevDateFilter = "s.created_at >= CURRENT_DATE - INTERVAL '1 day' AND s.created_at < CURRENT_DATE";
+    } else if (period === 'week') {
+        dateFilter = "s.created_at >= CURRENT_DATE - INTERVAL '7 days'";
+        prevDateFilter = "s.created_at >= CURRENT_DATE - INTERVAL '14 days' AND s.created_at < CURRENT_DATE - INTERVAL '7 days'";
+    } else if (period === 'month') {
+        dateFilter = "s.created_at >= CURRENT_DATE - INTERVAL '30 days'";
+        prevDateFilter = "s.created_at >= CURRENT_DATE - INTERVAL '60 days' AND s.created_at < CURRENT_DATE - INTERVAL '30 days'";
+    }
+
+    // 2. Текущая выручка и чеки
+    const currentStats = await pool.query(`SELECT COALESCE(SUM(s.total_price), 0) as total_revenue, COUNT(DISTINCT s.receipt_id) as total_checks FROM sales s JOIN stores st ON s.store_id = st.id WHERE st.owner_id = $1 AND ${dateFilter}`, [ownerId]);
+    const revenue = Number(currentStats.rows[0].total_revenue);
+    const checks = Number(currentStats.rows[0].total_checks);
+
+    // 3. Прошлая выручка и чеки (считаем зеленые/красные проценты)
+    const prevStats = await pool.query(`SELECT COALESCE(SUM(s.total_price), 0) as total_revenue, COUNT(DISTINCT s.receipt_id) as total_checks FROM sales s JOIN stores st ON s.store_id = st.id WHERE st.owner_id = $1 AND ${prevDateFilter}`, [ownerId]);
+    const prevRevenue = Number(prevStats.rows[0].total_revenue);
+    const prevChecks = Number(prevStats.rows[0].total_checks);
+
+    const revenueTrend = prevRevenue === 0 ? (revenue > 0 ? 100 : 0) : Math.round(((revenue - prevRevenue) / prevRevenue) * 100);
+    const checksTrend = prevChecks === 0 ? (checks > 0 ? 100 : 0) : Math.round(((checks - prevChecks) / prevChecks) * 100);
+
+    // 4. Заканчивающиеся товары (Меньше или равно 10 штук на всю сеть)
+    const lowStockRes = await pool.query(`
+        SELECT p.name, SUM(i.stock) as stock 
+        FROM products p JOIN inventory i ON p.id = i.product_id JOIN stores st ON i.store_id = st.id 
+        WHERE st.owner_id = $1 GROUP BY p.name HAVING SUM(i.stock) <= 10 ORDER BY stock ASC LIMIT 3
+    `, [ownerId]);
+
+    // 5. Топ 3 продаваемых товаров
+    const topSalesRes = await pool.query(`
+        SELECT p.name, p.icon, SUM(s.total_price) as total_sum 
+        FROM sales s JOIN products p ON s.product_id = p.id JOIN stores st ON s.store_id = st.id 
+        WHERE st.owner_id = $1 AND ${dateFilter} 
+        GROUP BY p.name, p.icon ORDER BY total_sum DESC LIMIT 3
+    `, [ownerId]);
+
+    // 6. Последние 4 операции (чека) в кассе
+    const recentLogsRes = await pool.query(`
+        SELECT s.receipt_id, SUM(s.total_price) as total_price, TO_CHAR(MIN(s.created_at), 'HH24:MI') as time 
+        FROM sales s JOIN stores st ON s.store_id = st.id 
+        WHERE st.owner_id = $1 
+        GROUP BY s.receipt_id ORDER BY MIN(s.created_at) DESC LIMIT 4
+    `, [ownerId]);
+
+    // 7. Сборка точек для графика (Математика осей X и Y)
+    const rawSales = await pool.query(`
+        SELECT s.total_price, s.created_at 
+        FROM sales s JOIN stores st ON s.store_id = st.id 
+        WHERE st.owner_id = $1 AND ${dateFilter}
+    `, [ownerId]);
+
+    let chartData = { labels: [], values: [] };
+
+    if (period === 'today') {
+        chartData.labels = ['Утро', 'День', 'Вечер', 'Ночь'];
+        chartData.values = [0, 0, 0, 0];
+        rawSales.rows.forEach(row => {
+            const hour = new Date(row.created_at).getHours();
+            if (hour >= 6 && hour < 12) chartData.values[0] += Number(row.total_price);
+            else if (hour >= 12 && hour < 18) chartData.values[1] += Number(row.total_price);
+            else if (hour >= 18 && hour < 23) chartData.values[2] += Number(row.total_price);
+            else chartData.values[3] += Number(row.total_price);
+        });
+    } else if (period === 'week') {
+        chartData.labels = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
+        chartData.values = [0, 0, 0, 0, 0, 0, 0];
+        rawSales.rows.forEach(row => {
+            let day = new Date(row.created_at).getDay(); // 0 = Вс, 1 = Пн
+            let index = day === 0 ? 6 : day - 1; 
+            chartData.values[index] += Number(row.total_price);
+        });
+    } else if (period === 'month') {
+        chartData.labels = ['5', '10', '15', '20', '25', '30'];
+        chartData.values = [0, 0, 0, 0, 0, 0];
+        rawSales.rows.forEach(row => {
+            const d = new Date(row.created_at).getDate();
+            if(d <= 5) chartData.values[0] += Number(row.total_price);
+            else if(d <= 10) chartData.values[1] += Number(row.total_price);
+            else if(d <= 15) chartData.values[2] += Number(row.total_price);
+            else if(d <= 20) chartData.values[3] += Number(row.total_price);
+            else if(d <= 25) chartData.values[4] += Number(row.total_price);
+            else chartData.values[5] += Number(row.total_price);
+        });
+    }
+
+    // Отправляем всё это богатство на фронтенд
+    res.json({
+        revenue, checks,
+        revenueTrend, checksTrend,
+        lowStock: lowStockRes.rows,
+        topSales: topSalesRes.rows,
+        recentLogs: recentLogsRes.rows,
+        chartData
+    });
+
+  } catch (err) { 
+    console.error('Ошибка дашборда:', err);
+    res.status(500).json({ error: 'Ошибка дашборда' }); 
+  }
 });
 
 app.post('/api/stores', authenticateToken, async (req, res) => {
