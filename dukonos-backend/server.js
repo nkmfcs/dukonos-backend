@@ -254,6 +254,27 @@ app.delete('/api/products/:id', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
 });
 
+// === ПОСТАВЩИКИ ===
+app.post('/api/suppliers/pay', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
+  const { amount, supplier_id } = req.body;
+  
+  try {
+    // 1. Уменьшаем долг перед поставщиком
+    await pool.query('UPDATE suppliers SET debt = debt - $1 WHERE id = $2 AND owner_id = $3', [amount, supplier_id, req.user.owner_id]);
+    
+    // 2. Создаем запись о расходе из кассы (чтобы наличные сошлись)
+    const storeRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id]);
+    const desc = 'Оплата долга поставщику #' + supplier_id;
+    await pool.query('INSERT INTO expenses (store_id, amount, category, description) VALUES ($1, $2, $3, $4)', [storeRes.rows[0].id, amount, 'Оплата поставщикам', desc]);
+    
+    res.json({ message: 'Долг погашен' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Ошибка оплаты поставщику' });
+  }
+});
+
 // === ФИНАНСЫ ===
 app.get('/api/finance', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
