@@ -245,5 +245,35 @@ app.post('/api/finance/expense', authenticateToken, async (req, res) => {
     res.json({ message: 'Расход записан' });
   } catch (err) { res.status(500).json({ error: 'Ошибка расхода' }); }
 });
+// --- ИНВЕНТАРИЗАЦИЯ (ПОЛУЧИТЬ ОСТАТКИ ДЛЯ МАГАЗИНА) ---
+app.get('/api/inventory/:store_id', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
+  try {
+    const result = await pool.query(`
+      SELECT p.id as product_id, p.name, p.icon, p.price, i.stock 
+      FROM products p 
+      JOIN inventory i ON p.id = i.product_id 
+      WHERE i.store_id = $1 AND p.owner_id = $2
+      ORDER BY p.name ASC;
+    `, [req.params.store_id, req.user.owner_id]);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: 'Ошибка получения инвентаря' }); }
+});
+
+// --- ИНВЕНТАРИЗАЦИЯ (СОХРАНИТЬ НОВЫЕ ОСТАТКИ) ---
+app.post('/api/inventory/update', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
+  const { store_id, inventory } = req.body; 
+  try {
+    for (let item of inventory) {
+        await pool.query(`
+            UPDATE inventory 
+            SET stock = $1 
+            WHERE store_id = $2 AND product_id = $3
+        `, [item.stock, store_id, item.product_id]);
+    }
+    res.json({ message: 'Остатки успешно обновлены' });
+  } catch (err) { res.status(500).json({ error: 'Ошибка обновления инвентаря' }); }
+});
 
 app.listen(port, () => { console.log(`Сервер запущен на ${port}`); });
