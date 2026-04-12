@@ -315,7 +315,22 @@ app.post('/api/sell', authenticateToken, async (req, res) => {
         store_id = (await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id])).rows[0].id; 
     }
     
-    const receipt_id = 'CHK-' + Date.now() + '-' + Math.floor(Math.random() * 1000);
+    // === ГЕНЕРАЦИЯ ПОРЯДКОВОГО НОМЕРА ЧЕКА (ГГММ-ХХХХ) ===
+    const now = new Date();
+    const yy = String(now.getFullYear()).slice(-2);
+    const mm = String(now.getMonth() + 1).padStart(2, '0');
+    const monthPrefix = `${yy}${mm}`; // Получится например "2604"
+
+    // Считаем, сколько чеков уже было выбито в этом месяце в этом магазине
+    const countRes = await pool.query(
+        `SELECT COUNT(DISTINCT receipt_id) as current_count FROM sales WHERE store_id = $1 AND receipt_id LIKE $2`, 
+        [store_id, `${monthPrefix}-%`]
+    );
+    
+    // Прибавляем 1 и форматируем (чтобы было 0001, 0002 и т.д.)
+    const nextNum = parseInt(countRes.rows[0].current_count) + 1;
+    const receipt_id = `${monthPrefix}-${String(nextNum).padStart(4, '0')}`; 
+    // ====================================================
 
     await pool.query('BEGIN');
 
