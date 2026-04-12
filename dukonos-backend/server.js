@@ -229,6 +229,7 @@ app.put('/api/stores/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// === СОТРУДНИКИ ===
 app.get('/api/employees', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
   try {
@@ -247,6 +248,34 @@ app.post('/api/employees', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
 });
 
+// НОВЫЙ МАРШРУТ: Изменение ПИН-кода
+app.put('/api/employees/:id/pin', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
+  const { pin } = req.body;
+  
+  if (!pin || pin.length < 4) return res.status(400).json({ error: 'ПИН-код должен быть не короче 4 цифр' });
+
+  try {
+    const salt = await bcrypt.genSalt(10);
+    const hash = await bcrypt.hash(pin, salt);
+    
+    // Меняем пароль только если сотрудник работает в магазине этого владельца
+    const updateRes = await pool.query(`
+        UPDATE employees 
+        SET password_hash = $1 
+        WHERE id = $2 AND store_id IN (SELECT id FROM stores WHERE owner_id = $3)
+        RETURNING id
+    `, [hash, req.params.id, req.user.owner_id]);
+
+    if (updateRes.rows.length === 0) return res.status(404).json({ error: 'Сотрудник не найден' });
+    res.json({ message: 'ПИН-код успешно изменен!' });
+  } catch (err) { 
+    console.error(err);
+    res.status(500).json({ error: 'Ошибка сервера при смене ПИН-кода' }); 
+  }
+});
+
+// === ЛОГИ ===
 app.get('/api/logs/:store_id', authenticateToken, async (req, res) => {
   try {
     const dateParam = req.query.date;
@@ -430,6 +459,7 @@ app.post('/api/suppliers/pay', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Ошибка оплаты поставщику' });
   }
 });
+
 app.delete('/api/suppliers/:id', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Доступ запрещен' });
   try {
