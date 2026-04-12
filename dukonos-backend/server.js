@@ -73,7 +73,7 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
     let dateFilter = "s.created_at >= CURRENT_DATE"; 
     if (period === 'week') dateFilter = "s.created_at >= CURRENT_DATE - INTERVAL '7 days'";
     if (period === 'month') dateFilter = "s.created_at >= CURRENT_DATE - INTERVAL '30 days'";
-    const result = await pool.query(`SELECT COALESCE(SUM(s.total_price), 0) as total_revenue, COUNT(s.id) as total_checks FROM sales s JOIN stores st ON s.store_id = st.id WHERE st.owner_id = $1 AND ${dateFilter};`, [req.user.owner_id]);
+    const result = await pool.query(`SELECT COALESCE(SUM(s.total_price), 0) as total_revenue, COUNT(DISTINCT s.receipt_id) as total_checks FROM sales s JOIN stores st ON s.store_id = st.id WHERE st.owner_id = $1 AND ${dateFilter};`, [req.user.owner_id]);
     res.json({ revenue: Number(result.rows[0].total_revenue), checks: Number(result.rows[0].total_checks) });
   } catch (err) { res.status(500).json({ error: 'Ошибка дашборда' }); }
 });
@@ -85,8 +85,7 @@ app.get('/api/stores', authenticateToken, async (req, res) => {
     let dateCondition = "created_at >= CURRENT_DATE";
     let queryParams = [req.user.owner_id];
     if (dateParam) { dateCondition = "DATE(created_at) = $2"; queryParams.push(dateParam); }
-    const result = await pool.query(`SELECT s.id, s.name, s.location, (SELECT COUNT(*) FROM employees WHERE store_id = s.id) as emp_count, COALESCE((SELECT SUM(total_price) FROM sales WHERE store_id = s.id AND ${dateCondition}), 0) as total_revenue, (SELECT COUNT(id) FROM sales WHERE store_id = s.id AND ${dateCondition}) as total_checks FROM stores s WHERE s.owner_id = $1 ORDER BY s.id ASC;`, queryParams);
-    res.json(result.rows);
+    const result = await pool.query(`SELECT COALESCE(SUM(s.total_price), 0) as total_revenue, COUNT(DISTINCT s.receipt_id) as total_checks FROM sales s JOIN stores st ON s.store_id = st.id WHERE st.owner_id = $1 AND ${dateFilter};`, [req.user.owner_id]);    res.json(result.rows);
   } catch (err) { res.status(500).json({ error: 'Ошибка сети' }); }
 });
 
