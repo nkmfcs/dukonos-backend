@@ -72,14 +72,11 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
     const period = req.query.period || 'today';
     const ownerId = req.user.owner_id;
 
-    // 1. Определяем фильтры дат для текущего и прошлого периодов (для трендов)
-    let dateFilter = "";
-    let prevDateFilter = "";
+    // 1. Определяем фильтры дат по умолчанию (для 'today')
+    let dateFilter = "s.created_at >= CURRENT_DATE";
+    let prevDateFilter = "s.created_at >= CURRENT_DATE - INTERVAL '1 day' AND s.created_at < CURRENT_DATE";
     
-    if (period === 'today') {
-        dateFilter = "s.created_at >= CURRENT_DATE";
-        prevDateFilter = "s.created_at >= CURRENT_DATE - INTERVAL '1 day' AND s.created_at < CURRENT_DATE";
-    } else if (period === 'week') {
+    if (period === 'week') {
         dateFilter = "s.created_at >= CURRENT_DATE - INTERVAL '7 days'";
         prevDateFilter = "s.created_at >= CURRENT_DATE - INTERVAL '14 days' AND s.created_at < CURRENT_DATE - INTERVAL '7 days'";
     } else if (period === 'month') {
@@ -164,7 +161,6 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
         });
     }
 
-    // Отправляем всё это богатство на фронтенд
     res.json({
         revenue, checks,
         revenueTrend, checksTrend,
@@ -178,6 +174,19 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
     console.error('Ошибка дашборда:', err);
     res.status(500).json({ error: 'Ошибка дашборда' }); 
   }
+});
+
+// ВОТ ТОТ САМЫЙ ПРОПАВШИЙ МАРШРУТ
+app.get('/api/stores', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
+  try {
+    const dateParam = req.query.date;
+    let dateCondition = "created_at >= CURRENT_DATE";
+    let queryParams = [req.user.owner_id];
+    if (dateParam) { dateCondition = "DATE(created_at) = $2"; queryParams.push(dateParam); }
+    const result = await pool.query(`SELECT s.id, s.name, s.location, (SELECT COUNT(*) FROM employees WHERE store_id = s.id) as emp_count, COALESCE((SELECT SUM(total_price) FROM sales WHERE store_id = s.id AND ${dateCondition}), 0) as total_revenue, (SELECT COUNT(DISTINCT receipt_id) FROM sales WHERE store_id = s.id AND ${dateCondition}) as total_checks FROM stores s WHERE s.owner_id = $1 ORDER BY s.id ASC;`, queryParams);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: 'Ошибка сети' }); }
 });
 
 app.post('/api/stores', authenticateToken, async (req, res) => {
@@ -306,10 +315,8 @@ app.post('/api/sell', authenticateToken, async (req, res) => {
         store_id = (await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id])).rows[0].id; 
     }
     
-    // Генерируем уникальный номер чека (например: CHK-1715000000000-123)
     const receipt_id = 'CHK-' + Date.now() + '-' + Math.floor(Math.random() * 1000);
 
-    // Начинаем SQL-транзакцию
     await pool.query('BEGIN');
 
     for (let item of cart) {
@@ -324,11 +331,9 @@ app.post('/api/sell', authenticateToken, async (req, res) => {
         await pool.query('INSERT INTO sales (store_id, product_id, quantity, total_price, payment_method, receipt_id) VALUES ($1, $2, $3, $4, $5, $6)', [store_id, item.product_id, item.quantity, total_price, payment_method || 'cash', receipt_id]);
     }
 
-    // Сохраняем все изменения в базе
     await pool.query('COMMIT');
     res.json({ message: 'Чек успешно пробит!', receipt_id });
   } catch (err) {
-    // Отменяем всё, если была ошибка (например, не хватило товара)
     await pool.query('ROLLBACK');
     console.error(err);
     res.status(400).json({ error: err.message || 'Ошибка при пробитии чека' });
@@ -350,10 +355,8 @@ app.post('/api/suppliers/pay', authenticateToken, async (req, res) => {
   const { amount, supplier_id } = req.body;
   
   try {
-    // 1. Уменьшаем долг перед поставщиком
     await pool.query('UPDATE suppliers SET debt = debt - $1 WHERE id = $2 AND owner_id = $3', [amount, supplier_id, req.user.owner_id]);
     
-    // 2. Создаем запись о расходе из кассы (чтобы наличные сошлись)
     const storeRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id]);
     const desc = 'Оплата долга поставщику #' + supplier_id;
     await pool.query('INSERT INTO expenses (store_id, amount, category, description) VALUES ($1, $2, $3, $4)', [storeRes.rows[0].id, amount, 'Оплата поставщикам', desc]);
