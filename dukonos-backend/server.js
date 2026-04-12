@@ -85,7 +85,8 @@ app.get('/api/stores', authenticateToken, async (req, res) => {
     let dateCondition = "created_at >= CURRENT_DATE";
     let queryParams = [req.user.owner_id];
     if (dateParam) { dateCondition = "DATE(created_at) = $2"; queryParams.push(dateParam); }
-    const result = await pool.query(`SELECT COALESCE(SUM(s.total_price), 0) as total_revenue, COUNT(DISTINCT s.receipt_id) as total_checks FROM sales s JOIN stores st ON s.store_id = st.id WHERE st.owner_id = $1 AND ${dateFilter};`, [req.user.owner_id]);    res.json(result.rows);
+    const result = await pool.query(`SELECT s.id, s.name, s.location, (SELECT COUNT(*) FROM employees WHERE store_id = s.id) as emp_count, COALESCE((SELECT SUM(total_price) FROM sales WHERE store_id = s.id AND ${dateCondition}), 0) as total_revenue, (SELECT COUNT(DISTINCT receipt_id) FROM sales WHERE store_id = s.id AND ${dateCondition}) as total_checks FROM stores s WHERE s.owner_id = $1 ORDER BY s.id ASC;`, queryParams);
+    res.json(result.rows);
   } catch (err) { res.status(500).json({ error: 'Ошибка сети' }); }
 });
 
@@ -121,14 +122,14 @@ app.get('/api/logs/:store_id', authenticateToken, async (req, res) => {
     let dateCondition = "s.created_at >= CURRENT_DATE";
     let queryParams = [req.params.store_id];
     if (dateParam) { dateCondition = "DATE(s.created_at) = $2"; queryParams.push(dateParam); }
-    const logs = await pool.query(`SELECT s.total_price, s.created_at, p.name as product_name, s.quantity FROM sales s JOIN products p ON s.product_id = p.id WHERE s.store_id = $1 AND ${dateCondition} ORDER BY s.created_at DESC LIMIT 50;`, queryParams);
+    const logs = await pool.query(`SELECT s.receipt_id, s.total_price, s.created_at, p.name as product_name, s.quantity FROM sales s JOIN products p ON s.product_id = p.id WHERE s.store_id = $1 AND ${dateCondition} ORDER BY s.created_at DESC LIMIT 50;`, queryParams);
     res.json(logs.rows);
   } catch (err) { res.status(500).json({ error: 'Ошибка логов' }); }
 });
 
 app.get('/api/logs_all', authenticateToken, async (req, res) => {
   try {
-    const logs = await pool.query(`SELECT s.total_price, s.created_at, p.name as product_name, s.quantity, st.name as store_name FROM sales s JOIN products p ON s.product_id = p.id JOIN stores st ON s.store_id = st.id WHERE st.owner_id = $1 ORDER BY s.created_at DESC LIMIT 150;`, [req.user.owner_id]);
+    const logs = await pool.query(`SELECT s.receipt_id, s.total_price, s.created_at, p.name as product_name, s.quantity, st.name as store_name FROM sales s JOIN products p ON s.product_id = p.id JOIN stores st ON s.store_id = st.id WHERE st.owner_id = $1 ORDER BY s.created_at DESC LIMIT 150;`, [req.user.owner_id]);
     res.json(logs.rows);
   } catch (err) { res.status(500).json({ error: 'Ошибка логов' }); }
 });
@@ -147,40 +148,31 @@ app.get('/api/products', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка БД' }); }
 });
 
-// АЛГОРИТМ АНТИ-ДУБЛИРОВАНИЯ ТОВАРОВ
 app.post('/api/products', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только владелец' });
   const { name, category, price, icon, target_store_id, stock } = req.body; 
   const initialStock = parseInt(stock) || 0;
   
   try {
-    // Ищем, есть ли такой товар
     const existRes = await pool.query('SELECT id FROM products WHERE LOWER(name) = LOWER($1) AND owner_id = $2', [name.trim(), req.user.owner_id]);
     let productId;
 
     if (existRes.rows.length > 0) {
-        // Товар найден! Не создаем дубликат, просто берем его ID
         productId = existRes.rows[0].id;
-        // Обновляем ему цену и категорию
         await pool.query('UPDATE products SET price = $1, category = $2, icon = $3 WHERE id = $4', [price, category, icon || '📦', productId]);
     } else {
-        // Товара нет - создаем
         const newP = await pool.query('INSERT INTO products (name, category, price, icon, owner_id) VALUES ($1, $2, $3, $4, $5) RETURNING id', [name.trim(), category, price, icon || '📦', req.user.owner_id]);
         productId = newP.rows[0].id;
 
-        // Создаем записи с 0 остатком для ВСЕХ магазинов
         const storesRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1', [req.user.owner_id]);
         for (let store of storesRes.rows) {
             await pool.query('INSERT INTO inventory (store_id, product_id, stock) VALUES ($1, $2, 0)', [store.id, productId]);
         }
     }
 
-    // Начисляем остаток
     if (target_store_id) {
-        // Добавлено из "Инвентаризации" -> кладем только в этот магазин
         await pool.query('UPDATE inventory SET stock = stock + $1 WHERE store_id = $2 AND product_id = $3', [initialStock, target_store_id, productId]);
     } else {
-        // Добавлено из "Базы товаров" -> кладем в первый магазин по умолчанию
         if (initialStock > 0) {
              const firstStore = await pool.query('SELECT id FROM stores WHERE owner_id = $1 ORDER BY id ASC LIMIT 1', [req.user.owner_id]);
              if (firstStore.rows.length > 0) {
@@ -193,7 +185,6 @@ app.post('/api/products', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка создания' }); }
 });
 
-// === МАРШРУТЫ ИНВЕНТАРИЗАЦИИ КОТОРЫХ НЕ БЫЛО НА ТВОЕМ СЕРВЕРЕ ===
 app.get('/api/inventory/:store_id', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
   try {
@@ -213,8 +204,8 @@ app.post('/api/inventory/update', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка обновления инвентаря' }); }
 });
 
+// === ПРОДАЖИ (ОБНОВЛЕННЫЙ МАРШРУТ С КОРЗИНОЙ И ТРАНЗАКЦИЯМИ) ===
 app.post('/api/sell', authenticateToken, async (req, res) => {
-  // Теперь мы ждем массив товаров "cart"
   const { cart, payment_method } = req.body; 
   
   try {
@@ -247,8 +238,9 @@ app.post('/api/sell', authenticateToken, async (req, res) => {
     await pool.query('COMMIT');
     res.json({ message: 'Чек успешно пробит!', receipt_id });
   } catch (err) {
-    // Если ошибка (например, мало товара) — отменяем весь чек
+    // Отменяем всё, если была ошибка (например, не хватило товара)
     await pool.query('ROLLBACK');
+    console.error(err);
     res.status(400).json({ error: err.message || 'Ошибка при пробитии чека' });
   }
 });
