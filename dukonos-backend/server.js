@@ -373,23 +373,27 @@ app.delete('/api/products/:id', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
 });
 
-// === ПОСТАВЩИКИ ===
-app.post('/api/suppliers/pay', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
-  const { amount, supplier_id } = req.body;
-  
+// === ПОСТАВЩИКИ (КОМПАНИИ) ===
+// Получить всех поставщиков
+app.get('/api/suppliers', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Доступ запрещен' });
   try {
-    await pool.query('UPDATE suppliers SET debt = debt - $1 WHERE id = $2 AND owner_id = $3', [amount, supplier_id, req.user.owner_id]);
-    
-    const storeRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id]);
-    const desc = 'Оплата долга поставщику #' + supplier_id;
-    await pool.query('INSERT INTO expenses (store_id, amount, category, description) VALUES ($1, $2, $3, $4)', [storeRes.rows[0].id, amount, 'Оплата поставщикам', desc]);
-    
-    res.json({ message: 'Долг погашен' });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Ошибка оплаты поставщику' });
-  }
+    const result = await pool.query('SELECT * FROM suppliers WHERE owner_id = $1 ORDER BY id DESC', [req.user.owner_id]);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: 'Ошибка загрузки поставщиков' }); }
+});
+
+// Добавить нового поставщика
+app.post('/api/suppliers', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Доступ запрещен' });
+  const { name, phone, visit_days } = req.body;
+  try {
+    await pool.query(
+      'INSERT INTO suppliers (name, phone, visit_days, debt, owner_id) VALUES ($1, $2, $3, 0, $4)',
+      [name, phone, visit_days, req.user.owner_id]
+    );
+    res.json({ message: 'Поставщик добавлен' });
+  } catch (err) { res.status(500).json({ error: 'Ошибка сервера' }); }
 });
 
 app.post('/api/suppliers', authenticateToken, async (req, res) => {
