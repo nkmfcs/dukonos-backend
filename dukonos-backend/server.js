@@ -182,16 +182,57 @@ app.get('/api/products', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка БД' }); }
 });
 
+// === ОБНОВЛЕННЫЙ МАРШРУТ ДОБАВЛЕНИЯ ТОВАРА ===
 app.post('/api/products', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только владелец' });
-  const { name, category, price, icon } = req.body;
+  
+  // Добавили target_store_id
+  const { name, category, price, icon, target_store_id } = req.body; 
   try {
     const newP = await pool.query('INSERT INTO products (name, category, price, icon, owner_id) VALUES ($1, $2, $3, $4, $5) RETURNING *', [name, category, price, icon || '📦', req.user.owner_id]);
     const productId = newP.rows[0].id;
-    const storesRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1', [req.user.owner_id]);
-    for (let store of storesRes.rows) await pool.query('INSERT INTO inventory (store_id, product_id, stock) VALUES ($1, $2, $3)', [store.id, productId, 50]);
+
+    if (target_store_id) {
+        // Товар добавлен из вкладки "Инвентаризация" - привязываем ТОЛЬКО к этому магазину
+        await pool.query('INSERT INTO inventory (store_id, product_id, stock) VALUES ($1, $2, $3)', [target_store_id, productId, 0]);
+    } else {
+        // Товар добавлен из "Базы товаров" - привязываем ко ВСЕМ магазинам сети
+        const storesRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1', [req.user.owner_id]);
+        for (let store of storesRes.rows) {
+            await pool.query('INSERT INTO inventory (store_id, product_id, stock) VALUES ($1, $2, $3)', [store.id, productId, 0]);
+        }
+    }
     res.json(newP.rows[0]);
   } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
+});
+
+// === НОВЫЕ МАРШРУТЫ ИНВЕНТАРИЗАЦИИ ===
+app.get('/api/inventory/:store_id', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
+  try {
+    // Берем только те товары, которые физически привязаны к выбранной точке
+    const result = await pool.query(`
+      SELECT p.id as product_id, p.name, p.category, p.icon, p.price, i.stock 
+      FROM products p 
+      JOIN inventory i ON p.id = i.product_id 
+      WHERE i.store_id = $1 AND p.owner_id = $2
+      ORDER BY p.id DESC;
+    `, [req.params.store_id, req.user.owner_id]);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: 'Ошибка получения инвентаря' }); }
+});
+
+app.post('/api/inventory/update', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
+  const { store_id, inventory } = req.body; 
+  try {
+    for (let item of inventory) {
+        await pool.query(`
+            UPDATE inventory SET stock = $1 WHERE store_id = $2 AND product_id = $3
+        `, [item.stock, store_id, item.product_id]);
+    }
+    res.json({ message: 'Остатки успешно обновлены' });
+  } catch (err) { res.status(500).json({ error: 'Ошибка обновления инвентаря' }); }
 });
 
 app.post('/api/sell', authenticateToken, async (req, res) => {
