@@ -214,24 +214,44 @@ app.post('/api/inventory/update', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка обновления инвентаря' }); }
 });
 
-// === ПРОДАЖИ ===
 app.post('/api/sell', authenticateToken, async (req, res) => {
-  const { product_id, quantity, payment_method } = req.body;
+  // Теперь мы ждем массив товаров "cart"
+  const { cart, payment_method } = req.body; 
+  
   try {
     let store_id;
-    if (req.user.role === 'employee') { store_id = req.user.store_id || (await pool.query('SELECT store_id FROM employees WHERE username = $1', [req.user.username])).rows[0].store_id; } 
-    else { store_id = (await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id])).rows[0].id; }
+    if (req.user.role === 'employee') { 
+        store_id = req.user.store_id || (await pool.query('SELECT store_id FROM employees WHERE username = $1', [req.user.username])).rows[0].store_id; 
+    } else { 
+        store_id = (await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id])).rows[0].id; 
+    }
     
-    const prodRes = await pool.query('SELECT price FROM products WHERE id = $1 AND owner_id = $2', [product_id, req.user.owner_id]);
-    if (prodRes.rows.length === 0) return res.status(404).json({ error: 'Товар не найден' });
-    const total_price = prodRes.rows[0].price * quantity;
-    
-    const updateRes = await pool.query('UPDATE inventory SET stock = stock - $1 WHERE store_id = $2 AND product_id = $3 AND stock >= $1 RETURNING stock;', [quantity, store_id, product_id]);
-    if (updateRes.rows.length === 0) return res.status(400).json({ error: 'Мало товара' });
-    
-    await pool.query('INSERT INTO sales (store_id, product_id, quantity, total_price, payment_method) VALUES ($1, $2, $3, $4, $5)', [store_id, product_id, quantity, total_price, payment_method || 'cash']);
-    res.json({ message: 'Продано!' });
-  } catch (err) { res.status(500).json({ error: 'Ошибка сервера' }); }
+    // Генерируем уникальный номер чека (например: CHK-1715000000000-123)
+    const receipt_id = 'CHK-' + Date.now() + '-' + Math.floor(Math.random() * 1000);
+
+    // Начинаем SQL-транзакцию
+    await pool.query('BEGIN');
+
+    for (let item of cart) {
+        const prodRes = await pool.query('SELECT price FROM products WHERE id = $1 AND owner_id = $2', [item.product_id, req.user.owner_id]);
+        if (prodRes.rows.length === 0) throw new Error(`Товар не найден`);
+        
+        const total_price = prodRes.rows[0].price * item.quantity;
+        
+        const updateRes = await pool.query('UPDATE inventory SET stock = stock - $1 WHERE store_id = $2 AND product_id = $3 AND stock >= $1 RETURNING stock;', [item.quantity, store_id, item.product_id]);
+        if (updateRes.rows.length === 0) throw new Error('Недостаточно товара на складе');
+        
+        await pool.query('INSERT INTO sales (store_id, product_id, quantity, total_price, payment_method, receipt_id) VALUES ($1, $2, $3, $4, $5, $6)', [store_id, item.product_id, item.quantity, total_price, payment_method || 'cash', receipt_id]);
+    }
+
+    // Сохраняем все изменения в базе
+    await pool.query('COMMIT');
+    res.json({ message: 'Чек успешно пробит!', receipt_id });
+  } catch (err) {
+    // Если ошибка (например, мало товара) — отменяем весь чек
+    await pool.query('ROLLBACK');
+    res.status(400).json({ error: err.message || 'Ошибка при пробитии чека' });
+  }
 });
 
 app.delete('/api/products/:id', authenticateToken, async (req, res) => {
