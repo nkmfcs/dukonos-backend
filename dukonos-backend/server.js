@@ -430,6 +430,16 @@ app.post('/api/suppliers/pay', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Ошибка оплаты поставщику' });
   }
 });
+app.delete('/api/suppliers/:id', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Доступ запрещен' });
+  try {
+    await pool.query('DELETE FROM suppliers WHERE id = $1 AND owner_id = $2', [req.params.id, req.user.owner_id]);
+    res.json({ message: 'Поставщик удален' });
+  } catch (err) { 
+    console.error(err);
+    res.status(500).json({ error: 'Ошибка сервера' }); 
+  }
+});
 
 // === ФИНАНСЫ ===
 app.get('/api/finance', authenticateToken, async (req, res) => {
