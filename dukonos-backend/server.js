@@ -392,6 +392,21 @@ app.post('/api/suppliers/pay', authenticateToken, async (req, res) => {
   }
 });
 
+app.post('/api/suppliers', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
+  const { name, phone, visit_days } = req.body;
+  try {
+    await pool.query(
+      'INSERT INTO suppliers (name, phone, visit_days, debt, owner_id) VALUES ($1, $2, $3, 0, $4)', 
+      [name, phone, visit_days, req.user.owner_id]
+    );
+    res.json({ message: 'Поставщик успешно добавлен!' });
+  } catch (err) { 
+    console.error(err);
+    res.status(500).json({ error: 'Ошибка при добавлении поставщика' }); 
+  }
+});
+
 // === ФИНАНСЫ ===
 app.get('/api/finance', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
@@ -401,8 +416,7 @@ app.get('/api/finance', authenticateToken, async (req, res) => {
     salesRes.rows.forEach(r => { if (r.payment_method === 'card') card += Number(r.total); else cash += Number(r.total); });
     const expRes = await pool.query(`SELECT SUM(amount) as total FROM expenses e JOIN stores st ON e.store_id = st.id WHERE st.owner_id = $1`, [req.user.owner_id]);
     const actualCash = cash - (Number(expRes.rows[0].total) || 0);
-    const supRes = await pool.query(`SELECT id, name, debt FROM suppliers WHERE owner_id = $1 ORDER BY id ASC`, [req.user.owner_id]);
-    res.json({ total_balance: actualCash + card, cash: actualCash, card: card, suppliers: supRes.rows });
+    const supRes = await pool.query(`SELECT id, name, debt, phone, visit_days FROM suppliers WHERE owner_id = $1 ORDER BY id ASC`, [req.user.owner_id]);    res.json({ total_balance: actualCash + card, cash: actualCash, card: card, suppliers: supRes.rows });
   } catch (err) { res.status(500).json({ error: 'Ошибка финансов' }); }
 });
 
