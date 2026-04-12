@@ -26,6 +26,7 @@ function authenticateToken(req, res, next) {
   });
 }
 
+// === АВТОРИЗАЦИЯ ===
 app.post('/api/register', async (req, res) => {
   const { email, password } = req.body;
   try {
@@ -65,18 +66,14 @@ app.get('/api/me', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка профиля' }); }
 });
 
+// === СЕТЬ И МАГАЗИНЫ ===
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
   try {
     const period = req.query.period || 'today';
     let dateFilter = "s.created_at >= CURRENT_DATE"; 
     if (period === 'week') dateFilter = "s.created_at >= CURRENT_DATE - INTERVAL '7 days'";
     if (period === 'month') dateFilter = "s.created_at >= CURRENT_DATE - INTERVAL '30 days'";
-
-    const result = await pool.query(`
-      SELECT COALESCE(SUM(s.total_price), 0) as total_revenue, COUNT(s.id) as total_checks 
-      FROM sales s JOIN stores st ON s.store_id = st.id 
-      WHERE st.owner_id = $1 AND ${dateFilter};
-    `, [req.user.owner_id]);
+    const result = await pool.query(`SELECT COALESCE(SUM(s.total_price), 0) as total_revenue, COUNT(s.id) as total_checks FROM sales s JOIN stores st ON s.store_id = st.id WHERE st.owner_id = $1 AND ${dateFilter};`, [req.user.owner_id]);
     res.json({ revenue: Number(result.rows[0].total_revenue), checks: Number(result.rows[0].total_checks) });
   } catch (err) { res.status(500).json({ error: 'Ошибка дашборда' }); }
 });
@@ -88,14 +85,7 @@ app.get('/api/stores', authenticateToken, async (req, res) => {
     let dateCondition = "created_at >= CURRENT_DATE";
     let queryParams = [req.user.owner_id];
     if (dateParam) { dateCondition = "DATE(created_at) = $2"; queryParams.push(dateParam); }
-
-    const result = await pool.query(`
-      SELECT s.id, s.name, s.location,
-        (SELECT COUNT(*) FROM employees WHERE store_id = s.id) as emp_count,
-        COALESCE((SELECT SUM(total_price) FROM sales WHERE store_id = s.id AND ${dateCondition}), 0) as total_revenue,
-        (SELECT COUNT(id) FROM sales WHERE store_id = s.id AND ${dateCondition}) as total_checks
-      FROM stores s WHERE s.owner_id = $1 ORDER BY s.id ASC;
-    `, queryParams);
+    const result = await pool.query(`SELECT s.id, s.name, s.location, (SELECT COUNT(*) FROM employees WHERE store_id = s.id) as emp_count, COALESCE((SELECT SUM(total_price) FROM sales WHERE store_id = s.id AND ${dateCondition}), 0) as total_revenue, (SELECT COUNT(id) FROM sales WHERE store_id = s.id AND ${dateCondition}) as total_checks FROM stores s WHERE s.owner_id = $1 ORDER BY s.id ASC;`, queryParams);
     res.json(result.rows);
   } catch (err) { res.status(500).json({ error: 'Ошибка сети' }); }
 });
@@ -127,34 +117,24 @@ app.post('/api/employees', authenticateToken, async (req, res) => {
 });
 
 app.get('/api/logs/:store_id', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
   try {
     const dateParam = req.query.date;
     let dateCondition = "s.created_at >= CURRENT_DATE";
     let queryParams = [req.params.store_id];
     if (dateParam) { dateCondition = "DATE(s.created_at) = $2"; queryParams.push(dateParam); }
-
-    const logs = await pool.query(`
-      SELECT s.total_price, s.created_at, p.name as product_name, s.quantity
-      FROM sales s JOIN products p ON s.product_id = p.id
-      WHERE s.store_id = $1 AND ${dateCondition} ORDER BY s.created_at DESC LIMIT 50;
-    `, queryParams);
+    const logs = await pool.query(`SELECT s.total_price, s.created_at, p.name as product_name, s.quantity FROM sales s JOIN products p ON s.product_id = p.id WHERE s.store_id = $1 AND ${dateCondition} ORDER BY s.created_at DESC LIMIT 50;`, queryParams);
     res.json(logs.rows);
   } catch (err) { res.status(500).json({ error: 'Ошибка логов' }); }
 });
 
 app.get('/api/logs_all', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
   try {
-    const logs = await pool.query(`
-      SELECT s.total_price, s.created_at, p.name as product_name, s.quantity, st.name as store_name
-      FROM sales s JOIN products p ON s.product_id = p.id JOIN stores st ON s.store_id = st.id
-      WHERE st.owner_id = $1 ORDER BY s.created_at DESC LIMIT 150;
-    `, [req.user.owner_id]);
+    const logs = await pool.query(`SELECT s.total_price, s.created_at, p.name as product_name, s.quantity, st.name as store_name FROM sales s JOIN products p ON s.product_id = p.id JOIN stores st ON s.store_id = st.id WHERE st.owner_id = $1 ORDER BY s.created_at DESC LIMIT 150;`, [req.user.owner_id]);
     res.json(logs.rows);
   } catch (err) { res.status(500).json({ error: 'Ошибка логов' }); }
 });
 
+// === ИНВЕНТАРИЗАЦИЯ И ТОВАРЫ ===
 app.get('/api/products', authenticateToken, async (req, res) => {
   try {
     if (req.user.role === 'employee') {
@@ -168,58 +148,78 @@ app.get('/api/products', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка БД' }); }
 });
 
-// === НОВАЯ УМНАЯ ЛОГИКА ДОБАВЛЕНИЯ ТОВАРОВ (АНТИ-ДУБЛИКАТ) ===
+// АЛГОРИТМ АНТИ-ДУБЛИРОВАНИЯ ТОВАРОВ
 app.post('/api/products', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только владелец' });
   const { name, category, price, icon, target_store_id, stock } = req.body; 
   const initialStock = parseInt(stock) || 0;
   
   try {
-    // 1. Проверяем, есть ли уже товар с таким именем в сети
-    const existRes = await pool.query('SELECT id FROM products WHERE LOWER(name) = LOWER($1) AND owner_id = $2', [name, req.user.owner_id]);
-    
+    // Ищем, есть ли такой товар
+    const existRes = await pool.query('SELECT id FROM products WHERE LOWER(name) = LOWER($1) AND owner_id = $2', [name.trim(), req.user.owner_id]);
     let productId;
 
     if (existRes.rows.length > 0) {
-        // Товар уже существует! Берем его ID, дубликат не создаем.
+        // Товар найден! Не создаем дубликат, просто берем его ID
         productId = existRes.rows[0].id;
+        // Обновляем ему цену и категорию (вдруг владелец решил поменять)
+        await pool.query('UPDATE products SET price = $1, category = $2, icon = $3 WHERE id = $4', [price, category, icon || '📦', productId]);
     } else {
-        // Товара нет - создаем новый
-        const newP = await pool.query('INSERT INTO products (name, category, price, icon, owner_id) VALUES ($1, $2, $3, $4, $5) RETURNING id', [name, category, price, icon || '📦', req.user.owner_id]);
+        // Товара нет - создаем
+        const newP = await pool.query('INSERT INTO products (name, category, price, icon, owner_id) VALUES ($1, $2, $3, $4, $5) RETURNING id', [name.trim(), category, price, icon || '📦', req.user.owner_id]);
         productId = newP.rows[0].id;
 
-        // Создаем записи с 0 остатком для ВСЕХ магазинов (чтобы товар был виден везде)
+        // Создаем записи с 0 остатком для ВСЕХ магазинов
         const storesRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1', [req.user.owner_id]);
         for (let store of storesRes.rows) {
             await pool.query('INSERT INTO inventory (store_id, product_id, stock) VALUES ($1, $2, 0)', [store.id, productId]);
         }
     }
 
-    // 2. Начисляем остаток
+    // Начисляем остаток
     if (target_store_id) {
-        // Добавляем остаток ТОЛЬКО в выбранный магазин
+        // Добавлено из "Инвентаризации" -> кладем только в этот магазин
         await pool.query('UPDATE inventory SET stock = stock + $1 WHERE store_id = $2 AND product_id = $3', [initialStock, target_store_id, productId]);
     } else {
-        // Добавляем остаток ВО ВСЕ магазины (если создаем глобально)
-        const storesRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1', [req.user.owner_id]);
-        for (let store of storesRes.rows) {
-            await pool.query('UPDATE inventory SET stock = stock + $1 WHERE store_id = $2 AND product_id = $3', [initialStock, store.id, productId]);
+        // Добавлено из "Базы товаров" -> кладем в первый магазин по умолчанию
+        if (initialStock > 0) {
+             const firstStore = await pool.query('SELECT id FROM stores WHERE owner_id = $1 ORDER BY id ASC LIMIT 1', [req.user.owner_id]);
+             if (firstStore.rows.length > 0) {
+                 await pool.query('UPDATE inventory SET stock = stock + $1 WHERE store_id = $2 AND product_id = $3', [initialStock, firstStore.rows[0].id, productId]);
+             }
         }
     }
     
-    res.json({ message: 'Success', id: productId });
-  } catch (err) { res.status(500).json({ error: 'Ошибка создания товара' }); }
+    res.json({ message: 'Success' });
+  } catch (err) { res.status(500).json({ error: 'Ошибка создания' }); }
+});
+
+app.get('/api/inventory/:store_id', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
+  try {
+    const result = await pool.query(`SELECT p.id as product_id, p.name, p.category, p.icon, p.price, i.stock FROM products p JOIN inventory i ON p.id = i.product_id WHERE i.store_id = $1 AND p.owner_id = $2 ORDER BY p.id DESC;`, [req.params.store_id, req.user.owner_id]);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: 'Ошибка получения инвентаря' }); }
+});
+
+app.post('/api/inventory/update', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
+  const { store_id, inventory } = req.body; 
+  try {
+    for (let item of inventory) {
+        await pool.query(`UPDATE inventory SET stock = $1 WHERE store_id = $2 AND product_id = $3`, [item.stock, store_id, item.product_id]);
+    }
+    res.json({ message: 'Остатки успешно обновлены' });
+  } catch (err) { res.status(500).json({ error: 'Ошибка обновления инвентаря' }); }
 });
 
 app.post('/api/sell', authenticateToken, async (req, res) => {
   const { product_id, quantity, payment_method } = req.body;
   try {
     let store_id;
-    if (req.user.role === 'employee') {
-        store_id = req.user.store_id || (await pool.query('SELECT store_id FROM employees WHERE username = $1', [req.user.username])).rows[0].store_id;
-    } else {
-        store_id = (await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id])).rows[0].id;
-    }
+    if (req.user.role === 'employee') { store_id = req.user.store_id || (await pool.query('SELECT store_id FROM employees WHERE username = $1', [req.user.username])).rows[0].store_id; } 
+    else { store_id = (await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id])).rows[0].id; }
+    
     const prodRes = await pool.query('SELECT price FROM products WHERE id = $1 AND owner_id = $2', [product_id, req.user.owner_id]);
     if (prodRes.rows.length === 0) return res.status(404).json({ error: 'Товар не найден' });
     const total_price = prodRes.rows[0].price * quantity;
@@ -239,32 +239,6 @@ app.delete('/api/products/:id', authenticateToken, async (req, res) => {
     await pool.query('DELETE FROM products WHERE id = $1 AND owner_id = $2', [req.params.id, req.user.owner_id]);
     res.json({ message: 'Удалено!' });
   } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
-});
-
-// === ИНВЕНТАРИЗАЦИЯ ===
-app.get('/api/inventory/:store_id', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
-  try {
-    const result = await pool.query(`
-      SELECT p.id as product_id, p.name, p.category, p.icon, p.price, i.stock 
-      FROM products p 
-      JOIN inventory i ON p.id = i.product_id 
-      WHERE i.store_id = $1 AND p.owner_id = $2
-      ORDER BY p.id DESC;
-    `, [req.params.store_id, req.user.owner_id]);
-    res.json(result.rows);
-  } catch (err) { res.status(500).json({ error: 'Ошибка получения инвентаря' }); }
-});
-
-app.post('/api/inventory/update', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
-  const { store_id, inventory } = req.body; 
-  try {
-    for (let item of inventory) {
-        await pool.query(`UPDATE inventory SET stock = $1 WHERE store_id = $2 AND product_id = $3`, [item.stock, store_id, item.product_id]);
-    }
-    res.json({ message: 'Остатки успешно обновлены' });
-  } catch (err) { res.status(500).json({ error: 'Ошибка обновления инвентаря' }); }
 });
 
 // === ФИНАНСЫ ===
