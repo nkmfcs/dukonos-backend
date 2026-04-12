@@ -197,6 +197,24 @@ app.post('/api/stores', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
 });
 
+// === ОБНОВЛЕНИЕ НАЗВАНИЯ МАГАЗИНА ===
+app.put('/api/stores/:id', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
+  const { name } = req.body;
+  
+  if (!name || name.trim() === '') {
+    return res.status(400).json({ error: 'Название не может быть пустым' });
+  }
+
+  try {
+    await pool.query('UPDATE stores SET name = $1 WHERE id = $2 AND owner_id = $3', [name.trim(), req.params.id, req.user.owner_id]);
+    res.json({ message: 'Название успешно изменено!' });
+  } catch (err) { 
+    console.error(err);
+    res.status(500).json({ error: 'Ошибка сервера при обновлении названия' }); 
+  }
+});
+
 app.get('/api/employees', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
   try {
