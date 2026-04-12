@@ -162,7 +162,7 @@ app.post('/api/products', authenticateToken, async (req, res) => {
     if (existRes.rows.length > 0) {
         // Товар найден! Не создаем дубликат, просто берем его ID
         productId = existRes.rows[0].id;
-        // Обновляем ему цену и категорию (вдруг владелец решил поменять)
+        // Обновляем ему цену и категорию
         await pool.query('UPDATE products SET price = $1, category = $2, icon = $3 WHERE id = $4', [price, category, icon || '📦', productId]);
     } else {
         // Товара нет - создаем
@@ -194,6 +194,7 @@ app.post('/api/products', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка создания' }); }
 });
 
+// === МАРШРУТЫ ИНВЕНТАРИЗАЦИИ КОТОРЫХ НЕ БЫЛО НА ТВОЕМ СЕРВЕРЕ ===
 app.get('/api/inventory/:store_id', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
   try {
@@ -213,6 +214,7 @@ app.post('/api/inventory/update', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка обновления инвентаря' }); }
 });
 
+// === ПРОДАЖИ ===
 app.post('/api/sell', authenticateToken, async (req, res) => {
   const { product_id, quantity, payment_method } = req.body;
   try {
