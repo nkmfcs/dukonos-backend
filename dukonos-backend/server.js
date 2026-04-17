@@ -4,17 +4,51 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+const AWS = require('aws-sdk');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 const port = 3000;
 
 app.use(cors());
-app.use(express.json());
+// Важно: увеличиваем лимит, чтобы картинки (Base64) пролезали в запросах
+app.use(express.json({ limit: '10mb' })); 
 
 const pool = new Pool({
   user: 'postgres', host: 'localhost', database: 'dukonos_db',
   password: process.env.DB_PASSWORD, port: 5432,
 });
+
+// === НАСТРОЙКА S3 ДЛЯ ФОТОГРАФИЙ ===
+const s3 = new AWS.S3({
+  endpoint: process.env.S3_ENDPOINT,
+  accessKeyId: process.env.S3_ACCESS_KEY,
+  secretAccessKey: process.env.S3_SECRET_KEY,
+  s3ForcePathStyle: true,
+});
+
+async function uploadImageToS3(base64String) {
+  if (!base64String || !base64String.startsWith('data:image')) return null;
+
+  const matches = base64String.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+  if (!matches || matches.length !== 3) return null;
+
+  const type = matches[1];
+  const buffer = Buffer.from(matches[2], 'base64');
+  const fileName = `products/${uuidv4()}.${type.split('/')[1]}`;
+
+  const params = {
+    Bucket: process.env.S3_BUCKET_NAME,
+    Key: fileName,
+    Body: buffer,
+    ContentType: type,
+    ACL: 'public-read' 
+  };
+
+  const uploadResult = await s3.upload(params).promise();
+  return uploadResult.Location; 
+}
+// ====================================
 
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
@@ -122,7 +156,7 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
     const lowStockRes = await pool.query(`
         SELECT p.name, SUM(i.stock) as stock 
         FROM products p JOIN inventory i ON p.id = i.product_id JOIN stores st ON i.store_id = st.id 
-        WHERE st.owner_id = $1 GROUP BY p.name HAVING SUM(i.stock) <= 10 ORDER BY stock ASC LIMIT 3
+        WHERE st.owner_id = $1 GROUP BY p.name HAVING SUM(i.stock) <= MIN(p.min_stock) ORDER BY stock ASC LIMIT 3
     `, [ownerId]);
 
     const topSalesRes = await pool.query(`
@@ -248,7 +282,6 @@ app.post('/api/employees', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
 });
 
-// НОВЫЙ МАРШРУТ: Изменение ПИН-кода
 app.put('/api/employees/:id/pin', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
   const { pin } = req.body;
@@ -259,7 +292,6 @@ app.put('/api/employees/:id/pin', authenticateToken, async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hash = await bcrypt.hash(pin, salt);
     
-    // Меняем пароль только если сотрудник работает в магазине этого владельца
     const updateRes = await pool.query(`
         UPDATE employees 
         SET password_hash = $1 
@@ -294,75 +326,123 @@ app.get('/api/logs_all', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка логов' }); }
 });
 
-// === ИНВЕНТАРИЗАЦИЯ И ТОВАРЫ ===
+
+// ==============================================
+// 📦 ИНВЕНТАРИЗАЦИЯ И ТОВАРЫ (ОБНОВЛЕННАЯ ЛОГИКА)
+// ==============================================
+
+// Получение товаров (Для Базы и для Кассы)
 app.get('/api/products', authenticateToken, async (req, res) => {
   try {
     if (req.user.role === 'employee') {
+      // Работник видит только то, что есть в его магазине
       const store_id = req.user.store_id || (await pool.query('SELECT store_id FROM employees WHERE username = $1', [req.user.username])).rows[0].store_id;
-      const result = await pool.query(`SELECT p.id, p.icon, p.name, p.category, p.barcode, p.price, i.stock FROM products p JOIN inventory i ON p.id = i.product_id WHERE i.store_id = $1 ORDER BY p.id DESC;`, [store_id]);
+      const result = await pool.query(`
+          SELECT p.id, p.icon, p.name, p.category as cat, p.price, i.stock, p.image_url as image 
+          FROM products p JOIN inventory i ON p.id = i.product_id 
+          WHERE i.store_id = $1 ORDER BY p.id DESC;
+      `, [store_id]);
       res.json(result.rows);
     } else {
-      const result = await pool.query(`SELECT p.id, p.icon, p.name, p.category, p.barcode, p.price, SUM(i.stock) as stock FROM products p JOIN inventory i ON p.id = i.product_id JOIN stores st ON i.store_id = st.id WHERE st.owner_id = $1 GROUP BY p.id, p.icon, p.name, p.category, p.barcode, p.price ORDER BY p.id DESC;`, [req.user.owner_id]);
+      // Владелец видит ВСЕ товары (Главный склад)
+      const result = await pool.query(`
+          SELECT id, icon, name, category as cat, price, stock, min_stock as "minStock", image_url as image 
+          FROM products WHERE owner_id = $1 ORDER BY id DESC;
+      `, [req.user.owner_id]);
       res.json(result.rows);
     }
   } catch (err) { res.status(500).json({ error: 'Ошибка БД' }); }
 });
 
+// Создание нового товара (На Главный склад)
 app.post('/api/products', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только владелец' });
-  const { name, category, price, icon, target_store_id, stock } = req.body; 
-  const initialStock = parseInt(stock) || 0;
+  const { name, cat, price, icon, stock, minStock, image } = req.body; 
   
   try {
-    const existRes = await pool.query('SELECT id FROM products WHERE LOWER(name) = LOWER($1) AND owner_id = $2', [name.trim(), req.user.owner_id]);
-    let productId;
-
-    if (existRes.rows.length > 0) {
-        productId = existRes.rows[0].id;
-        await pool.query('UPDATE products SET price = $1, category = $2, icon = $3 WHERE id = $4', [price, category, icon || '📦', productId]);
-    } else {
-        const newP = await pool.query('INSERT INTO products (name, category, price, icon, owner_id) VALUES ($1, $2, $3, $4, $5) RETURNING id', [name.trim(), category, price, icon || '📦', req.user.owner_id]);
-        productId = newP.rows[0].id;
-
-        const storesRes = await pool.query('SELECT id FROM stores WHERE owner_id = $1', [req.user.owner_id]);
-        for (let store of storesRes.rows) {
-            await pool.query('INSERT INTO inventory (store_id, product_id, stock) VALUES ($1, $2, 0)', [store.id, productId]);
-        }
+    let imageUrl = image;
+    if (image && image.startsWith('data:image')) {
+        imageUrl = await uploadImageToS3(image);
     }
 
-    if (target_store_id) {
-        await pool.query('UPDATE inventory SET stock = stock + $1 WHERE store_id = $2 AND product_id = $3', [initialStock, target_store_id, productId]);
-    } else {
-        if (initialStock > 0) {
-             const firstStore = await pool.query('SELECT id FROM stores WHERE owner_id = $1 ORDER BY id ASC LIMIT 1', [req.user.owner_id]);
-             if (firstStore.rows.length > 0) {
-                 await pool.query('UPDATE inventory SET stock = stock + $1 WHERE store_id = $2 AND product_id = $3', [initialStock, firstStore.rows[0].id, productId]);
-             }
-        }
-    }
+    const newP = await pool.query(`
+        INSERT INTO products (name, category, price, icon, owner_id, stock, min_stock, image_url) 
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *
+    `, [name.trim(), cat, price, icon || '📦', req.user.owner_id, stock || 0, minStock || 10, imageUrl]);
     
-    res.json({ message: 'Success' });
+    const saved = newP.rows[0];
+    res.json({ id: saved.id, name: saved.name, cat: saved.category, price: saved.price, stock: saved.stock, minStock: saved.min_stock, image: saved.image_url, icon: saved.icon });
   } catch (err) { res.status(500).json({ error: 'Ошибка создания' }); }
 });
 
-app.get('/api/inventory/:store_id', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
+// Редактирование товара
+app.put('/api/products/:id', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только владелец' });
+  const { id } = req.params;
+  const { name, cat, price, stock, minStock, icon, image } = req.body;
   try {
-    const result = await pool.query(`SELECT p.id as product_id, p.name, p.category, p.icon, p.price, i.stock FROM products p JOIN inventory i ON p.id = i.product_id WHERE i.store_id = $1 AND p.owner_id = $2 ORDER BY p.id DESC;`, [req.params.store_id, req.user.owner_id]);
-    res.json(result.rows);
-  } catch (err) { res.status(500).json({ error: 'Ошибка получения инвентаря' }); }
+    let imageUrl = image;
+    if (image && image.startsWith('data:image')) {
+        imageUrl = await uploadImageToS3(image);
+    }
+
+    const result = await pool.query(`
+       UPDATE products 
+       SET name = $1, category = $2, price = $3, stock = $4, min_stock = $5, icon = $6, image_url = $7 
+       WHERE id = $8 AND owner_id = $9 RETURNING *
+    `, [name.trim(), cat, price, stock, minStock, icon, imageUrl, id, req.user.owner_id]);
+
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Не найдено' });
+    const updated = result.rows[0];
+    res.json({ id: updated.id, name: updated.name, cat: updated.category, price: updated.price, stock: updated.stock, minStock: updated.min_stock, image: updated.image_url, icon: updated.icon });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
+// Удаление товара (И с базы, и из всех магазинов)
+app.delete('/api/products/:id', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только владелец' });
+  try {
+    await pool.query('DELETE FROM inventory WHERE product_id = $1', [req.params.id]);
+    await pool.query('DELETE FROM products WHERE id = $1 AND owner_id = $2', [req.params.id, req.user.owner_id]);
+    res.json({ message: 'Удалено!' });
+  } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
+});
+
+// Сохранение остатков конкретного магазина (Вкладка "Инвентаризация")
 app.post('/api/inventory/update', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
+  
+  // Фронтенд должен присылать JSON вида: { store_id: 1, inventory: { "5": 20, "12": 0 } }
+  // Где "5" и "12" это product_id, а 20 и 0 — это stock.
   const { store_id, inventory } = req.body; 
+  
+  const client = await pool.connect();
   try {
-    for (let item of inventory) {
-        await pool.query(`UPDATE inventory SET stock = $1 WHERE store_id = $2 AND product_id = $3`, [item.stock, store_id, item.product_id]);
+    await client.query('BEGIN');
+    await client.query('DELETE FROM inventory WHERE store_id = $1', [store_id]);
+    
+    for (const [productId, qty] of Object.entries(inventory)) {
+      if (qty > 0) {
+        await client.query(
+          'INSERT INTO inventory (store_id, product_id, stock) VALUES ($1, $2, $3)',
+          [store_id, productId, qty]
+        );
+      }
     }
+    await client.query('COMMIT');
     res.json({ message: 'Остатки успешно обновлены' });
-  } catch (err) { res.status(500).json({ error: 'Ошибка обновления инвентаря' }); }
+  } catch (err) { 
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: 'Ошибка обновления инвентаря' }); 
+  } finally {
+    client.release();
+  }
 });
+
+// ==============================================
+
 
 // === ПРОДАЖИ ===
 app.post('/api/sell', authenticateToken, async (req, res) => {
@@ -412,14 +492,6 @@ app.post('/api/sell', authenticateToken, async (req, res) => {
   }
 });
 
-app.delete('/api/products/:id', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только владелец' });
-  try {
-    await pool.query('DELETE FROM inventory WHERE product_id = $1', [req.params.id]);
-    await pool.query('DELETE FROM products WHERE id = $1 AND owner_id = $2', [req.params.id, req.user.owner_id]);
-    res.json({ message: 'Удалено!' });
-  } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
-});
 
 // === ПОСТАВЩИКИ (КОМПАНИИ) ===
 app.get('/api/suppliers', authenticateToken, async (req, res) => {
