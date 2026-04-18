@@ -569,4 +569,34 @@ app.post('/api/finance/expense', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка расхода' }); }
 });
 
+// Маршрут для сохранения инвентаризации (остатков) магазина
+app.post('/api/inventory/:storeId', authenticateToken, async (req, res) => {
+    const { storeId } = req.params;
+    const { inventory } = req.body; // Получаем объект { productId: quantity }
+
+    try {
+        // Начинаем транзакцию, чтобы данные сохранились надежно
+        await pool.query('BEGIN');
+
+        // Сначала удаляем старые остатки для этого магазина (если они были)
+        await pool.query('DELETE FROM store_inventory WHERE store_id = $1', [storeId]);
+
+        // Записываем новые остатки
+        const insertQuery = 'INSERT INTO store_inventory (store_id, product_id, quantity) VALUES ($1, $2, $3)';
+        
+        for (const [productId, quantity] of Object.entries(inventory)) {
+            if (quantity > 0) {
+                await pool.query(insertQuery, [storeId, productId, quantity]);
+            }
+        }
+
+        await pool.query('COMMIT');
+        res.json({ message: 'Остатки успешно сохранены' });
+    } catch (err) {
+        await pool.query('ROLLBACK');
+        console.error('Ошибка при сохранении инвентаризации:', err);
+        res.status(500).json({ error: 'Ошибка сервера при сохранении' });
+    }
+});
+
 app.listen(port, () => { console.log(`Сервер запущен на ${port}`); });
