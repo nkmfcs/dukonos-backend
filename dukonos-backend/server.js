@@ -413,35 +413,35 @@ app.delete('/api/products/:id', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Ошибка' }); }
 });
 
-// Сохранение остатков конкретного магазина (Вкладка "Инвентаризация")
-app.post('/api/inventory/update', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
-  
-  // Фронтенд должен присылать JSON вида: { store_id: 1, inventory: { "5": 20, "12": 0 } }
-  // Где "5" и "12" это product_id, а 20 и 0 — это stock.
-  const { store_id, inventory } = req.body; 
-  
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    await client.query('DELETE FROM inventory WHERE store_id = $1', [store_id]);
+// ЗАМЕНИТЬ старый маршрут app.post('/api/inventory/:storeId', ...) на этот:
+app.post('/api/inventory/:storeId', authenticateToken, async (req, res) => {
+    if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только для владельца' });
     
-    for (const [productId, qty] of Object.entries(inventory)) {
-      if (qty > 0) {
-        await client.query(
-          'INSERT INTO inventory (store_id, product_id, stock) VALUES ($1, $2, $3)',
-          [store_id, productId, qty]
-        );
-      }
+    const storeId = req.params.storeId;
+    const { inventory } = req.body;
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        await client.query('DELETE FROM inventory WHERE store_id = $1', [storeId]);
+        
+        for (const [productId, qty] of Object.entries(inventory)) {
+            if (qty > 0) {
+                await client.query(
+                    'INSERT INTO inventory (store_id, product_id, stock) VALUES ($1, $2, $3)',
+                    [storeId, productId, qty]
+                );
+            }
+        }
+        await client.query('COMMIT');
+        res.json({ message: 'Остатки сохранены' });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err);
+        res.status(500).json({ error: 'Ошибка сохранения' });
+    } finally {
+        client.release();
     }
-    await client.query('COMMIT');
-    res.json({ message: 'Остатки успешно обновлены' });
-  } catch (err) { 
-    await client.query('ROLLBACK');
-    res.status(500).json({ error: 'Ошибка обновления инвентаря' }); 
-  } finally {
-    client.release();
-  }
 });
 
 // ==============================================
