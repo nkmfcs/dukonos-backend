@@ -15,8 +15,11 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' })); 
 
 const pool = new Pool({
-  user: 'postgres', host: 'localhost', database: 'dukonos_db',
-  password: process.env.DB_PASSWORD, port: 5432,
+  user: process.env.DB_USER,
+  host: 'localhost',
+  database: 'dukonos_db',
+  password: process.env.DB_PASSWORD,
+  port: 5432,
 });
 
 // === НАСТРОЙКА S3 ДЛЯ ФОТОГРАФИЙ ===
