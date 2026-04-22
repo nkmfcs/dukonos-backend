@@ -1,10 +1,10 @@
-require('dotenv').config();
+require('dotenv').config({ path: '/home/uz-user/dukonos-backend/dukonos-backend/.env' });
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID: uuidv4 } = require('crypto');
 const fs = require('fs');
 
 const app = express();
@@ -338,14 +338,14 @@ app.get('/api/products', authenticateToken, async (req, res) => {
     if (req.user.role === 'employee') {
       const store_id = req.user.store_id || (await pool.query('SELECT store_id FROM employees WHERE username = $1', [req.user.username])).rows[0].store_id;
       const result = await pool.query(`
-        SELECT p.id, p.icon, p.name, p.category as cat, p.price, i.stock, p.image_url as image
+        SELECT p.id, p.icon, p.name, p.category as cat, p.price, i.stock, p.image_url as image, p.is_weight, p.unit
         FROM products p JOIN inventory i ON p.id = i.product_id
         WHERE i.store_id = $1 ORDER BY p.id DESC;
       `, [store_id]);
       res.json(result.rows);
     } else {
       const result = await pool.query(`
-        SELECT id, icon, name, category as cat, price, stock, min_stock as "minStock", image_url as image
+        SELECT id, icon, name, category as cat, price, stock, min_stock as "minStock", image_url as image, is_weight, unit
         FROM products WHERE owner_id = $1 ORDER BY id DESC;
       `, [req.user.owner_id]);
       res.json(result.rows);
@@ -355,25 +355,29 @@ app.get('/api/products', authenticateToken, async (req, res) => {
 
 app.post('/api/products', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только владелец' });
-  const { name, cat, price, icon, stock, minStock, image } = req.body;
+  const { name, cat, price, icon, stock, minStock, image, is_weight, unit } = req.body;
   try {
     let imageUrl = image;
     if (image && image.startsWith('data:image')) {
       imageUrl = await uploadImageToS3(image);
     }
     const newP = await pool.query(`
-      INSERT INTO products (name, category, price, icon, owner_id, stock, min_stock, image_url)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *
-    `, [name.trim(), cat, price, icon || '📦', req.user.owner_id, stock || 0, minStock || 10, imageUrl]);
+      INSERT INTO products (name, category, price, icon, owner_id, stock, min_stock, image_url, is_weight, unit)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *
+    `, [name.trim(), cat, price, icon || '📦', req.user.owner_id, stock || 0, minStock || 10, imageUrl, is_weight || false, unit || 'pcs']);
     const saved = newP.rows[0];
-    res.json({ id: saved.id, name: saved.name, cat: saved.category, price: saved.price, stock: saved.stock, minStock: saved.min_stock, image: saved.image_url, icon: saved.icon });
+    const stores = await pool.query(`SELECT id FROM stores WHERE owner_id = $1`, [req.user.owner_id]);
+    for (const store of stores.rows) {
+      await pool.query(`INSERT INTO inventory (store_id, product_id, stock) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, [store.id, saved.id, stock || 0]);
+    }
+    res.json({ id: saved.id, name: saved.name, cat: saved.category, price: saved.price, stock: saved.stock, minStock: saved.min_stock, image: saved.image_url, icon: saved.icon, is_weight: saved.is_weight, unit: saved.unit });
   } catch (err) { res.status(500).json({ error: 'Ошибка создания' }); }
 });
 
 app.put('/api/products/:id', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только владелец' });
   const { id } = req.params;
-  const { name, cat, price, stock, minStock, icon, image } = req.body;
+  const { name, cat, price, stock, minStock, icon, image, is_weight, unit } = req.body;
   try {
     let imageUrl = image;
     if (image && image.startsWith('data:image')) {
@@ -381,9 +385,9 @@ app.put('/api/products/:id', authenticateToken, async (req, res) => {
     }
     const result = await pool.query(`
       UPDATE products
-      SET name = $1, category = $2, price = $3, stock = $4, min_stock = $5, icon = $6, image_url = $7
+      SET name = $1, category = $2, price = $3, stock = $4, min_stock = $5, icon = $6, image_url = $7, is_weight = $10, unit = $11
       WHERE id = $8 AND owner_id = $9 RETURNING *
-    `, [name.trim(), cat, price, stock, minStock, icon, imageUrl, id, req.user.owner_id]);
+    `, [name.trim(), cat, price, stock, minStock, icon, imageUrl, id, req.user.owner_id, is_weight || false, unit || 'pcs']);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Не найдено' });
     const updated = result.rows[0];
     res.json({ id: updated.id, name: updated.name, cat: updated.category, price: updated.price, stock: updated.stock, minStock: updated.min_stock, image: updated.image_url, icon: updated.icon });
@@ -453,17 +457,17 @@ app.post('/api/sell', authenticateToken, async (req, res) => {
     await pool.query('BEGIN');
 
     for (let item of cart) {
-      const prodRes = await pool.query('SELECT price FROM products WHERE id = $1 AND owner_id = $2', [item.product_id, req.user.owner_id]);
-      if (prodRes.rows.length === 0) throw new Error(`Товар не найден`);
-
-      const total_price = prodRes.rows[0].price * item.quantity;
-
-      const updateRes = await pool.query('UPDATE inventory SET stock = stock - $1 WHERE store_id = $2 AND product_id = $3 AND stock >= $1 RETURNING stock;', [item.quantity, store_id, item.product_id]);
+      const product_id = parseInt(item.product_id) || item.product_id;
+      const prodRes = await pool.query('SELECT price FROM products WHERE id = $1', [product_id]);
+      if (prodRes.rows.length === 0) throw new Error('Товар не найден');
+      const quantity = item.is_weight ? (item.grams / 1000) : item.quantity;
+      const total_price = prodRes.rows[0].price * quantity;
+      const updateRes = await pool.query('UPDATE inventory SET stock = stock - $1 WHERE store_id = $2 AND product_id = $3 AND stock >= $1 RETURNING stock;', [quantity, store_id, product_id]);
       if (updateRes.rows.length === 0) throw new Error('Недостаточно товара на складе');
 
       await pool.query(
         'INSERT INTO sales (store_id, product_id, quantity, total_price, receipt_id, payment_method) VALUES ($1, $2, $3, $4, $5, $6)',
-        [store_id, item.product_id, item.quantity, total_price, receipt_id, payment_method]
+        [store_id, product_id, quantity, total_price, receipt_id, payment_method]
       );
     }
 
@@ -722,16 +726,16 @@ app.get('/v1/sync/products', authenticateToken, async (req, res) => {
     if (req.user.role === 'employee') {
       const store_id = req.user.store_id || (await pool.query('SELECT store_id FROM employees WHERE username = $1', [req.user.username])).rows[0].store_id;
       const result = await pool.query(`
-        SELECT p.barcode, p.name, p.price, i.stock
+        SELECT p.id, p.barcode, p.name, p.price, i.stock, p.is_weight, p.unit
         FROM products p JOIN inventory i ON p.id = i.product_id
-        WHERE i.store_id = $1 AND p.is_active = true
+        WHERE i.store_id = $1
       `, [store_id]);
       rows = result.rows;
     } else {
       const result = await pool.query(`
-        SELECT barcode, name, price, stock
+        SELECT id, name, price, stock, is_weight, unit
         FROM products
-        WHERE owner_id = $1 AND is_active = true
+        WHERE owner_id = $1
       `, [req.user.owner_id]);
       rows = result.rows;
     }
@@ -942,4 +946,231 @@ app.get('/api/dev/system', authenticateToken, requireDev, async (req, res) => {
 
 app.get('/api/dev/errors', authenticateToken, requireDev, async (req, res) => {
   res.json(errorLog.slice(0, 50));
+});
+
+// === НАСИЯ ===
+
+// Получить всех клиентов магазина
+app.get('/api/clients', authenticateToken, async (req, res) => {
+  try {
+    let store_id;
+    if (req.user.role === 'employee') {
+      const emp = await pool.query('SELECT store_id FROM employees WHERE username = $1', [req.user.username]);
+      store_id = emp.rows[0].store_id;
+    } else {
+      const st = await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id]);
+      store_id = st.rows[0].id;
+    }
+    const result = await pool.query(`
+      SELECT c.*, 
+        COALESCE(SUM(CASE WHEN n.is_paid = false THEN n.amount ELSE 0 END), 0) as debt,
+        COUNT(CASE WHEN n.is_paid = false THEN 1 END) as open_count
+      FROM clients c
+      LEFT JOIN nasiya n ON n.client_id = c.id
+      WHERE c.store_id = $1
+      GROUP BY c.id
+      ORDER BY c.created_at DESC
+    `, [store_id]);
+    res.json(result.rows);
+  } catch(err) { console.error('clients error:', err.message); res.status(500).json({ error: err.message }); }
+});
+
+// Добавить клиента
+app.post('/api/clients', authenticateToken, async (req, res) => {
+  const { name, phone, note } = req.body;
+  try {
+    const store_id = req.user.role === 'employee'
+      ? (await pool.query('SELECT store_id FROM employees WHERE username = $1', [req.user.username])).rows[0].store_id
+      : (await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id])).rows[0].id;
+    const result = await pool.query(
+      'INSERT INTO clients (store_id, name, phone, note) VALUES ($1, $2, $3, $4) RETURNING *',
+      [store_id, name.trim(), phone || '', note || '']
+    );
+    res.json(result.rows[0]);
+  } catch(err) { res.status(500).json({ error: 'Ошибка' }); }
+});
+
+// Удалить клиента
+app.delete('/api/clients/:id', authenticateToken, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM nasiya WHERE client_id = $1', [req.params.id]);
+    await pool.query('DELETE FROM clients WHERE id = $1', [req.params.id]);
+    res.json({ ok: true });
+  } catch(err) { res.status(500).json({ error: 'Ошибка' }); }
+});
+
+// Получить долги клиента
+app.get('/api/nasiya/:clientId', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM nasiya WHERE client_id = $1 ORDER BY created_at DESC',
+      [req.params.clientId]
+    );
+    res.json(result.rows);
+  } catch(err) { res.status(500).json({ error: 'Ошибка' }); }
+});
+
+// Добавить долг
+app.post('/api/nasiya', authenticateToken, async (req, res) => {
+  const { client_id, amount, description } = req.body;
+  try {
+    const store_id = req.user.role === 'employee'
+      ? (await pool.query('SELECT store_id FROM employees WHERE username = $1', [req.user.username])).rows[0].store_id
+      : (await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id])).rows[0].id;
+    const result = await pool.query(
+      'INSERT INTO nasiya (store_id, client_id, amount, description) VALUES ($1, $2, $3, $4) RETURNING *',
+      [store_id, client_id, amount, description || '']
+    );
+    res.json(result.rows[0]);
+  } catch(err) { res.status(500).json({ error: 'Ошибка' }); }
+});
+
+// Отметить долг оплаченным
+app.patch('/api/nasiya/:id/pay', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'UPDATE nasiya SET is_paid = true, paid_at = NOW() WHERE id = $1 RETURNING *',
+      [req.params.id]
+    );
+    res.json(result.rows[0]);
+  } catch(err) { res.status(500).json({ error: 'Ошибка' }); }
+});
+
+// === НАСИЯ ЧЕКИ (ЗАМОРОЖЕННЫЕ) ===
+
+// Заморозить чек
+app.post('/api/nasiya-carts', authenticateToken, async (req, res) => {
+  const { client_id, items, total_price } = req.body;
+  const client = await pool.connect();
+  try {
+    let store_id, created_by;
+    if (req.user.role === 'employee') {
+      const emp = await pool.query('SELECT store_id, name FROM employees WHERE username = $1', [req.user.username]);
+      store_id = emp.rows[0].store_id;
+      created_by = emp.rows[0].name || req.user.username;
+    } else {
+      store_id = (await pool.query('SELECT id FROM stores WHERE owner_id = $1 LIMIT 1', [req.user.owner_id])).rows[0].id;
+      created_by = 'Владелец';
+    }
+
+    // Генерация receipt_id
+    const now = new Date();
+    const prefix = `N${String(now.getFullYear()).slice(-2)}${String(now.getMonth()+1).padStart(2,'0')}`;
+    const count = (await pool.query('SELECT COUNT(*) FROM nasiya_carts WHERE store_id=$1 AND receipt_id LIKE $2', [store_id, `${prefix}-%`])).rows[0].count;
+    const receipt_id = `${prefix}-${String(parseInt(count)+1).padStart(4,'0')}`;
+
+    await client.query('BEGIN');
+
+    // Резервируем товары — уменьшаем остаток
+    for (const item of items) {
+      const upd = await client.query(
+        'UPDATE inventory SET stock = stock - $1 WHERE store_id=$2 AND product_id=$3 AND stock >= $1 RETURNING stock',
+        [item.qty, store_id, item.id]
+      );
+      if (upd.rows.length === 0) throw new Error(`Недостаточно товара: ${item.name}`);
+    }
+
+    const result = await client.query(
+      'INSERT INTO nasiya_carts (store_id, client_id, receipt_id, items, total_price, created_by) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
+      [store_id, client_id, receipt_id, JSON.stringify(items), total_price, created_by]
+    );
+
+    await client.query('COMMIT');
+    res.json(result.rows[0]);
+  } catch(err) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ error: err.message });
+  } finally { client.release(); }
+});
+
+// Получить замороженные чеки магазина
+app.get('/api/nasiya-carts', authenticateToken, async (req, res) => {
+  try {
+    let store_id;
+    if (req.user.role === 'employee') {
+      store_id = (await pool.query('SELECT store_id FROM employees WHERE username=$1', [req.user.username])).rows[0].store_id;
+    } else {
+      store_id = (await pool.query('SELECT id FROM stores WHERE owner_id=$1 LIMIT 1', [req.user.owner_id])).rows[0].id;
+    }
+    const result = await pool.query(`
+      SELECT nc.*, c.name as client_name, c.phone as client_phone
+      FROM nasiya_carts nc
+      LEFT JOIN clients c ON c.id = nc.client_id
+      WHERE nc.store_id=$1 AND nc.status='frozen'
+      ORDER BY nc.created_at DESC
+    `, [store_id]);
+    res.json(result.rows);
+  } catch(err) { res.status(500).json({ error: 'Ошибка' }); }
+});
+
+// Оплатить замороженный чек
+app.patch('/api/nasiya-carts/:id/pay', authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const cart = (await pool.query('SELECT * FROM nasiya_carts WHERE id=$1', [req.params.id])).rows[0];
+    if (!cart) return res.status(404).json({ error: 'Чек не найден' });
+    if (cart.status === 'paid') return res.status(400).json({ error: 'Уже оплачен' });
+
+    await client.query('BEGIN');
+
+    // Записать продажи
+    const now = new Date();
+    const yy = String(now.getFullYear()).slice(-2);
+    const mm = String(now.getMonth()+1).padStart(2,'0');
+    const monthPrefix = `${yy}${mm}`;
+    const countRes = await client.query(
+      'SELECT COUNT(DISTINCT receipt_id) as c FROM sales WHERE store_id=$1 AND receipt_id LIKE $2',
+      [cart.store_id, `${monthPrefix}-%`]
+    );
+    const receipt_id = `${monthPrefix}-${String(parseInt(countRes.rows[0].c)+1).padStart(4,'0')}`;
+
+    for (const item of cart.items) {
+      const price = await pool.query('SELECT price FROM products WHERE id=$1', [item.id]);
+      await client.query(
+        'INSERT INTO sales (store_id, product_id, quantity, total_price, receipt_id, payment_method) VALUES ($1,$2,$3,$4,$5,$6)',
+        [cart.store_id, item.id, item.qty, price.rows[0].price * item.qty, receipt_id, 'nasiya']
+      );
+    }
+
+    await client.query('UPDATE nasiya_carts SET status=$1, paid_at=NOW() WHERE id=$2', ['paid', cart.id]);
+    await client.query('COMMIT');
+    res.json({ ok: true, receipt_id });
+  } catch(err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally { client.release(); }
+});
+
+// Отменить замороженный чек (вернуть товары)
+app.patch('/api/nasiya-carts/:id/cancel', authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const cart = (await pool.query('SELECT * FROM nasiya_carts WHERE id=$1', [req.params.id])).rows[0];
+    if (!cart || cart.status !== 'frozen') return res.status(400).json({ error: 'Нельзя отменить' });
+
+    await client.query('BEGIN');
+    // Вернуть товары в склад
+    for (const item of cart.items) {
+      await client.query('UPDATE inventory SET stock=stock+$1 WHERE store_id=$2 AND product_id=$3', [item.qty, cart.store_id, item.id]);
+    }
+    await client.query('UPDATE nasiya_carts SET status=$1 WHERE id=$2', ['cancelled', cart.id]);
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch(err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally { client.release(); }
+});
+
+// Обновить поставщика
+app.put('/api/suppliers/:id', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только владелец' });
+  const { name, phone, visit_days, debt, last_delivery, notes } = req.body;
+  try {
+    const result = await pool.query(
+      'UPDATE suppliers SET name=$1, phone=$2, visit_days=$3, debt=$4, last_delivery=$5, notes=$6 WHERE id=$7 AND owner_id=$8 RETURNING *',
+      [name, phone, visit_days, debt||0, last_delivery||null, notes||'', req.params.id, req.user.owner_id]
+    );
+    res.json(result.rows[0]);
+  } catch(err) { res.status(500).json({ error: 'Ошибка' }); }
 });
