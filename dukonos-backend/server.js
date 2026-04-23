@@ -338,14 +338,14 @@ app.get('/api/products', authenticateToken, async (req, res) => {
     if (req.user.role === 'employee') {
       const store_id = req.user.store_id || (await pool.query('SELECT store_id FROM employees WHERE username = $1', [req.user.username])).rows[0].store_id;
       const result = await pool.query(`
-        SELECT p.id, p.icon, p.name, p.category as cat, p.price, i.stock, p.image_url as image, p.is_weight, p.unit
+        SELECT p.id, p.icon, p.name, p.category as cat, p.price, i.stock, p.image_url as image, p.is_weight, p.unit, p.barcode
         FROM products p JOIN inventory i ON p.id = i.product_id
         WHERE i.store_id = $1 ORDER BY p.id DESC;
       `, [store_id]);
       res.json(result.rows);
     } else {
       const result = await pool.query(`
-        SELECT id, icon, name, category as cat, price, stock, min_stock as "minStock", image_url as image, is_weight, unit
+        SELECT id, icon, name, category as cat, price, stock, min_stock as "minStock", image_url as image, is_weight, unit, barcode
         FROM products WHERE owner_id = $1 ORDER BY id DESC;
       `, [req.user.owner_id]);
       res.json(result.rows);
