@@ -366,10 +366,8 @@ app.post('/api/products', authenticateToken, async (req, res) => {
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *
     `, [name.trim(), cat, price, icon || '📦', req.user.owner_id, stock || 0, minStock || 10, imageUrl, is_weight || false, unit || 'pcs']);
     const saved = newP.rows[0];
-    const stores = await pool.query(`SELECT id FROM stores WHERE owner_id = $1`, [req.user.owner_id]);
-    for (const store of stores.rows) {
-      await pool.query(`INSERT INTO inventory (store_id, product_id, stock) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, [store.id, saved.id, stock || 0]);
-    }
+    // Товар добавляется только в базу (products), НЕ в inventory магазинов.
+    // Владелец вручную добавляет товар в нужный магазин через инвентаризацию (кнопка "+").
     res.json({ id: saved.id, name: saved.name, cat: saved.category, price: saved.price, stock: saved.stock, minStock: saved.min_stock, image: saved.image_url, icon: saved.icon, is_weight: saved.is_weight, unit: saved.unit });
   } catch (err) { res.status(500).json({ error: 'Ошибка создания' }); }
 });
