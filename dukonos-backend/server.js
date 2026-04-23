@@ -731,7 +731,7 @@ app.get('/v1/sync/products', authenticateToken, async (req, res) => {
       rows = result.rows;
     } else {
       const result = await pool.query(`
-        SELECT id, name, price, stock, is_weight, unit
+        SELECT id, name, price, stock, is_weight, unit, barcode
         FROM products
         WHERE owner_id = $1
       `, [req.user.owner_id]);
