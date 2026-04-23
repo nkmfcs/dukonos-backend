@@ -355,20 +355,18 @@ app.get('/api/products', authenticateToken, async (req, res) => {
 
 app.post('/api/products', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только владелец' });
-  const { name, cat, price, icon, stock, minStock, image, is_weight, unit } = req.body;
+  const { name, cat, price, icon, stock, minStock, image, is_weight, unit, barcode } = req.body;
   try {
     let imageUrl = image;
     if (image && image.startsWith('data:image')) {
       imageUrl = await uploadImageToS3(image);
     }
     const newP = await pool.query(`
-      INSERT INTO products (name, category, price, icon, owner_id, stock, min_stock, image_url, is_weight, unit)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *
-    `, [name.trim(), cat, price, icon || '📦', req.user.owner_id, stock || 0, minStock || 10, imageUrl, is_weight || false, unit || 'pcs']);
+      INSERT INTO products (name, category, price, icon, owner_id, stock, min_stock, image_url, is_weight, unit, barcode)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *
+    `, [name.trim(), cat, price, icon || '📦', req.user.owner_id, stock || 0, minStock || 10, imageUrl, is_weight || false, unit || 'pcs', barcode || null]);
     const saved = newP.rows[0];
-    // Товар добавляется только в базу (products), НЕ в inventory магазинов.
-    // Владелец вручную добавляет товар в нужный магазин через инвентаризацию (кнопка "+").
-    res.json({ id: saved.id, name: saved.name, cat: saved.category, price: saved.price, stock: saved.stock, minStock: saved.min_stock, image: saved.image_url, icon: saved.icon, is_weight: saved.is_weight, unit: saved.unit });
+    res.json({ id: saved.id, name: saved.name, cat: saved.category, price: saved.price, stock: saved.stock, minStock: saved.min_stock, image: saved.image_url, icon: saved.icon, is_weight: saved.is_weight, unit: saved.unit, barcode: saved.barcode });
   } catch (err) { res.status(500).json({ error: 'Ошибка создания' }); }
 });
 
