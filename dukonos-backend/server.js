@@ -375,7 +375,7 @@ app.post('/api/products', authenticateToken, async (req, res) => {
 app.put('/api/products/:id', authenticateToken, async (req, res) => {
   if (req.user.role !== 'owner') return res.status(403).json({ error: 'Только владелец' });
   const { id } = req.params;
-  const { name, cat, price, stock, minStock, icon, image, is_weight, unit } = req.body;
+  const { name, cat, price, stock, minStock, icon, image, is_weight, unit, barcode } = req.body;
   try {
     let imageUrl = image;
     if (image && image.startsWith('data:image')) {
@@ -383,12 +383,12 @@ app.put('/api/products/:id', authenticateToken, async (req, res) => {
     }
     const result = await pool.query(`
       UPDATE products
-      SET name = $1, category = $2, price = $3, stock = $4, min_stock = $5, icon = $6, image_url = $7, is_weight = $10, unit = $11
+      SET name = $1, category = $2, price = $3, stock = $4, min_stock = $5, icon = $6, image_url = $7, is_weight = $10, unit = $11, barcode = $12
       WHERE id = $8 AND owner_id = $9 RETURNING *
-    `, [name.trim(), cat, price, stock, minStock, icon, imageUrl, id, req.user.owner_id, is_weight || false, unit || 'pcs']);
+    `, [name.trim(), cat, price, stock, minStock, icon, imageUrl, id, req.user.owner_id, is_weight || false, unit || 'pcs', barcode || null]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Не найдено' });
     const updated = result.rows[0];
-    res.json({ id: updated.id, name: updated.name, cat: updated.category, price: updated.price, stock: updated.stock, minStock: updated.min_stock, image: updated.image_url, icon: updated.icon });
+    res.json({ id: updated.id, name: updated.name, cat: updated.category, price: updated.price, stock: updated.stock, minStock: updated.min_stock, image: updated.image_url, icon: updated.icon, barcode: updated.barcode });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
